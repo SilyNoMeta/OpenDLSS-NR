@@ -5,7 +5,7 @@
 //
 //   dlss5-demo [scene.gltf|.glb [environment.hdr]] --model <nr model dir> [--scenes <dir>] [--width w --height h]
 //              [--frames n] [--capture prefix] [--orbit deg/frame] [--view px,py,pz,tx,ty,tz[,fov]] [--nr 0|1]
-//              [--temporal 0|1] [--style 0..3] [--style-knobs ...] [--intensity x] [--kernels <dir>]
+//              [--temporal 0|1] [--style 0..3] [--style-knobs ...] [--intensity x] [--kernels <dir>] [--max-fps n]
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -50,6 +50,15 @@
 #include "scene.h"
 #include "vulkan_device.h"
 
+#if defined(_WIN32)
+// Hybrid-graphics laptops: ask the NVIDIA Optimus and AMD PowerXpress drivers to run this program on the discrete GPU
+// (the only one that can run the network) instead of the power-saving integrated one.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
 using namespace filament;
 using namespace filament::math;
 namespace fs = std::filesystem;
@@ -64,6 +73,7 @@ struct Options {
   int animation = 0;
   NrControls controls;
   int style = 0, networkStyle = 0;
+  int maxFps = 0;   // 0: uncapped (the swapchain's pacing only); a cap saves power and heat on a laptop
 };
 
 struct FirstPersonCamera {
@@ -109,7 +119,7 @@ std::string readFile(const std::string& path) {
 const char* kUsage = "usage: dlss5-demo [scene.gltf|.glb [environment.hdr]] --model <nr model dir> [--scenes <dir>] [--width w --height h] "
                      "[--frames n] [--capture prefix] [--orbit deg] [--view px,py,pz,tx,ty,tz[,fov]] [--nr 0|1] [--temporal 0|1] "
                      "[--style 0..3] [--style-knobs exposure,contrast,gamma,saturation,hue,vibrance,strength[,networkStyle]] [--intensity x] "
-                     "[--animation n]";
+                     "[--animation n] [--max-fps n]";
 
 Options parseOptions(int argc, char** argv) {
   Options o;
@@ -128,6 +138,7 @@ Options parseOptions(int argc, char** argv) {
     else if (a == "--frames") { next(v); o.frames = atoi(v.c_str()); }
     else if (a == "--orbit") { next(v); o.orbitDegreesPerFrame = (float)atof(v.c_str()); }
     else if (a == "--animation") { next(v); o.animation = atoi(v.c_str()); }
+    else if (a == "--max-fps") { next(v); o.maxFps = std::max(atoi(v.c_str()), 0); }
     else if (a == "--temporal") { next(v); o.controls.temporal = atoi(v.c_str()) != 0; }
     else if (a == "--nr") { next(v); o.controls.enabled = atoi(v.c_str()) != 0; }
     else if (a == "--intensity") { next(v); o.controls.intensity = (float)atof(v.c_str()); }
@@ -494,6 +505,12 @@ int main(int argc, char** argv) {
       if (w >= 64 && h >= 64 && ((uint32_t)w != width || (uint32_t)h != height)) resize((uint32_t)w, (uint32_t)h);
     }
 
+    // the frame cap: sleep out the rest of the frame's budget rather than render frames nobody asked for
+    if (options.maxFps > 0) {
+      const auto budget = std::chrono::duration<double>(1.0 / options.maxFps);
+      const auto remaining = budget - (std::chrono::high_resolution_clock::now() - lastTime);
+      if (remaining.count() > 0.001) SDL_Delay((Uint32)(remaining.count() * 1000.0));
+    }
     // (the renderer paces the frames: when it asks to skip one, wait a little instead of spinning)
     if (!renderer->beginFrame(swapChain)) { SDL_Delay(1); continue; }
     auto now = std::chrono::high_resolution_clock::now();
@@ -566,6 +583,7 @@ int main(int argc, char** argv) {
       ImGui::PushItemWidth(140.0f);
       ImGui::Text("%s", nr->deviceName().c_str());
       ImGui::Text("%.0f fps (%.2f ms cpu)", fpsValue, cpuFrameMs);
+      ImGui::SliderInt("FPS cap", &options.maxFps, 0, 240, options.maxFps ? "%d" : "off");
       if (ImGui::CollapsingHeader("DLSS NR", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::Checkbox("Enabled", &controls.enabled)) historyReset = true;
         if (ImGui::Checkbox("Temporal", &controls.temporal)) historyReset = true;

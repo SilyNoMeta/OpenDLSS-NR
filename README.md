@@ -167,6 +167,25 @@ ordinary compute shaders. Fused kernels, PTX launches and barrier-free chaining 
   `%LOCALAPPDATA%\dlss5-vulkan` or `DLSS5_FILAMENT_BUILD_DIR`; `DLSS5_BUILD_JOBS` caps the parallel
   compiles, default 8, because MSVC takes up to a GB per job on Filament).
 
+### Laptops
+
+Laptop RTX 40 / 50 series GPUs (an RTX 5050 Laptop GPU, say) run the same kernels, at the speed their SM count and
+power limit allow. What usually stops a laptop is not the GPU:
+
+- **The driver.** Manufacturer drivers often lag behind and lack `VK_EXT_shader_float8` or `VK_NV_cooperative_matrix2`.
+  Install the current Game Ready or Studio driver from nvidia.com.
+- **The integrated GPU.** A hybrid (Optimus) laptop lists its Intel or AMD integrated GPU too, often first. Both
+  programs take the discrete NVIDIA GPU whatever the order, and export `NvOptimusEnablement` so the driver starts them
+  on it; `DLSS5VK_DEVICE=<index or part of the name>` picks one by hand. When no device qualifies, the error lists
+  every device and what it lacks. If Windows still assigns the integrated GPU, set the program to **High
+  performance** under Settings > System > Display > Graphics.
+- **Power.** Run on the charger: on battery the GPU clocks down hard. `dlss5-demo --max-fps 60` (or the FPS cap
+  slider) caps the frame rate to save power and heat, and a smaller window (`--width 1280 --height 720`, the
+  default) keeps the network's cost down, since it runs at the window's resolution.
+
+`bench` falls back to barriers (`DLSS5VK_CHAIN=0`) when a chained wait times out on its warm-up frame, as the demo
+does, instead of failing.
+
 ## Model directory
 
 `nr::Model` reads `manifest.json`: a `stages` array (each entry: `id`, `file` relative to the directory,
@@ -208,6 +227,7 @@ All default to the fast, exact route. Every switch keeps the output byte-identic
 them is part of the gate. Any switch that sends a kernel back to GLSL also turns counter chaining off, because
 only the PTX kernels take part in it.
 
+- `DLSS5VK_DEVICE=<index or part of the name>` picks the GPU (see [Laptops](#laptops)).
 - `DLSS5VK_UNFUSED=1` runs the GLSL reference route, up to 2560x1440: it materializes every intermediate.
 - `DLSS5VK_PTX_DIR` is the PTX directory, default `build/ptx`.
 - `DLSS5VK_CHAIN=0` puts barriers between every launch instead of counter chaining.

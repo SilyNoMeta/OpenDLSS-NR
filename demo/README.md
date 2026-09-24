@@ -49,6 +49,7 @@ The window can be resized; the network re-fits to the new size.
 - `--width w --height h`, `--scenes <dir>`, `--kernels <dir>`
 - `--view px,py,pz,tx,ty,tz[,fov]` places the camera
 - `--nr 0` runs without the network, `--temporal 0` without history
+- `--max-fps n` caps the frame rate (also the **FPS cap** slider; 0 is uncapped), to save power and heat on a laptop
 - `--style 1|2`, `--intensity x`, `--animation n`
 - `--frames N --capture prefix` is the scripted run: it captures at frames 40, 100, 160 and 200 of a
   static, orbit, settle, NR-off sequence, and dumps the raw scene and velocity buffers at frames 99 and 100 and

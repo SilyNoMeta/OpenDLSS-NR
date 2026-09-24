@@ -30,8 +30,15 @@ uint32_t NrPass::shaderReadOnlyLayout() { return (uint32_t)VK_IMAGE_LAYOUT_SHADE
 NrPass::NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const std::string& modelDir, const std::string& kernelDir,
                const std::string& demoShaderDir)
     : device_((VkDevice)device.device), width_(width), height_(height), demoShaderDir_(demoShaderDir) {
-  context_ = std::make_unique<vk::Context>((VkInstance)device.instance, (VkPhysicalDevice)device.physicalDevice, device_,
-                                           device.queueFamily, device.nrQueueIndex);
+  vk::BorrowedDevice borrowed;
+  borrowed.instance = (VkInstance)device.instance;
+  borrowed.physical = (VkPhysicalDevice)device.physicalDevice;
+  borrowed.device = device_;
+  borrowed.queueFamily = device.queueFamily;
+  borrowed.queueIndex = device.nrQueueIndex;
+  borrowed.backend = (vk::Backend)device.backend;
+  borrowed.createInfo = static_cast<const VkDeviceCreateInfo*>(device.createInfo);
+  context_ = std::make_unique<vk::Context>(borrowed);
   fprintf(stderr, "[nr] context adopted (%s, queue %u.%u)\n", context_->deviceName().c_str(), device.queueFamily, device.nrQueueIndex);
   model_ = std::make_unique<nr::Model>(*context_, modelDir, false);
   fprintf(stderr, "[nr] model loaded\n");

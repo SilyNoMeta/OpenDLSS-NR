@@ -28,6 +28,7 @@ endif()
 # ---- the NR side: the device, the pass, the kernels' host code (volk, the repository's Vulkan headers)
 add_library(nr STATIC
     ${ROOT}/src/vk_context.cpp
+    ${ROOT}/src/gpu_arch.cpp
     ${ROOT}/src/kernels.cpp
     ${ROOT}/src/nr_graph.cpp
     ${ROOT}/src/nr_model.cpp

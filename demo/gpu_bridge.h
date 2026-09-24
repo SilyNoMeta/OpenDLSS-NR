@@ -13,6 +13,8 @@ struct GpuDevice {
   uint32_t rendererQueueIndex = 0; // the queue Filament submits on
   uint32_t nrQueueIndex = 0;       // the queue the NR side submits its own (rare, synchronous) work on
   bool debugUtils = false;
+  uint32_t backend = 0;            // vk::Backend the device was created for
+  const void* createInfo = nullptr;  // the VkDeviceCreateInfo it was created with (features and extensions enabled)
 };
 
 // A Filament texture as the backend holds it: image (VkImage), format (VkFormat), layout (VkImageLayout)

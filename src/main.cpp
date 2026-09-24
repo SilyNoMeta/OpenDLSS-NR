@@ -12,6 +12,7 @@
 #include <fstream>
 #include <array>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -24,6 +25,15 @@
 #include "numeric.h"
 #include "reference.h"
 #include "vk_context.h"
+
+#if defined(_WIN32)
+// Hybrid-graphics laptops: ask the NVIDIA Optimus and AMD PowerXpress drivers to run this program on the discrete GPU
+// (the only one that can run the network) instead of the power-saving integrated one.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 
 namespace {
 
@@ -578,17 +588,36 @@ int runBench(int argc, char** argv) {
   nr::Kernels kernels(context, shaderDir);
   kernels.setSiluTable(ref::siluTable());
   nr::Geometry geometry = nr::Geometry::fromValid(width, height);
-  nr::Graph graph(context, model, kernels, geometry, {.fusedBlocks = fusedBlocksEnabled()});
   const uint32_t fullRows = geometry.fullWidth * geometry.fullHeight;
-  nr::Activation* features = graph.allocate("input features", fullRows, 16, nr::Format::F32);
   std::vector<float> synthetic((size_t)fullRows * 16);
   for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = num::roundF16(std::sin(i * 0.0017f) * 0.125f);
-  context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
-  // Warm compile.
+  std::unique_ptr<nr::Graph> graph;
+  nr::Activation* features = nullptr;
+  auto build = [&]() {
+    graph.reset();
+    graph = std::make_unique<nr::Graph>(context, model, kernels, geometry, nr::Graph::Options{.fusedBlocks = fusedBlocksEnabled()});
+    features = graph->allocate("input features", fullRows, 16, nr::Format::F32);
+    context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
+  };
+  build();
+  // Warm compile. A chained wait that timed out here (a GPU that schedules the launches differently) rebuilds the
+  // graph with barriers, as the demo does, instead of failing the run; later frames still fail on one.
   {
     VkCommandBuffer commands = context.beginCommands();
-    graph.record(commands, *features);
+    graph->record(commands, *features);
     context.endAndSubmit(commands, true);
+    const nr::Kernels::ChainTimeouts timeouts = kernels.chainTimeouts();
+    if (timeouts.waits && nr::Kernels::chainEnabled()) {
+      fprintf(stderr, "%u chained wait(s) timed out, the first on %s: rebuilding with barriers (DLSS5VK_CHAIN=0)\n",
+              timeouts.waits, timeouts.counter.c_str());
+      nr::Kernels::setChainEnabled(false);
+      kernels.resetChainTimeouts();
+      build();
+      context.resetDescriptorPool();
+      commands = context.beginCommands();
+      graph->record(commands, *features);
+      context.endAndSubmit(commands, true);
+    }
     checkChainTimeouts(kernels);
   }
   VkQueryPool queries = context.createTimestampPool(2);
@@ -598,7 +627,7 @@ int runBench(int argc, char** argv) {
     VkCommandBuffer commands = context.beginCommands();
     vkCmdResetQueryPool(commands, queries, 0, 2);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
-    graph.record(commands, *features);
+    graph->record(commands, *features);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
     context.endAndSubmit(commands, true);
     checkChainTimeouts(kernels);

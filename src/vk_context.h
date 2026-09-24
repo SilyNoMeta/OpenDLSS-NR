@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -53,9 +54,22 @@ struct Pipeline {
   const char* label = "";
 };
 
-// The device features / extensions the NR kernels need, as a stable pNext chain (the demo hands it to the
-// renderer's device creation; Context::Context() uses it for its own device).
+// The routes the NR kernels run on. Each has its own device requirements and its own kernels, and none stands in for
+// another unless asked to: DLSS5VK_BACKEND=auto (the default) takes the fastest route the device supports and says
+// which and why; an explicit name is that route or an error.
+enum class Backend {
+  Native,   // E4M3 cooperative matrices + FP8 PTX, fused blocks, counter chaining (Ada, Hopper, Blackwell)
+  Compat,   // software E4M3 in scalar GLSL: any NVIDIA Vulkan 1.3 GPU, no tensor cores, no fusion, no chaining
+};
+const char* backendName(Backend backend);          // "native", "compat"
+const char* backendDescription(Backend backend);   // one line for logs
+std::optional<Backend> requestedBackend();          // DLSS5VK_BACKEND, empty for auto; throws on an unknown name
+
+// The device features / extensions a backend needs, as a stable pNext chain (the demo hands it to the renderer's
+// device creation; Context::Context() uses it for its own device). With enable = false the chain is the same with
+// nothing set, ready for vkGetPhysicalDeviceFeatures2. Not copyable: the chain points into the object.
 struct DeviceRequirements {
+  Backend backend;
   VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
   VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
   VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -67,16 +81,44 @@ struct DeviceRequirements {
   VkPhysicalDeviceShaderSMBuiltinsFeaturesNV sm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV};
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
   std::vector<const char*> extensions;
-  explicit DeviceRequirements(bool nativeFp8 = true);  // fills the chain and extension list for the selected backend
+  explicit DeviceRequirements(Backend backend, bool enable = true);
+  DeviceRequirements(const DeviceRequirements&) = delete;
+  DeviceRequirements& operator=(const DeviceRequirements&) = delete;
   void* pNextChain() { return features.pNext; }   // for a VkDeviceCreateInfo that carries VkPhysicalDeviceFeatures itself
+};
+
+// The physical device and backend for the NR kernels. Each device is checked against every candidate backend's
+// extensions and features (plus `extraExtensions`, e.g. a swapchain); the fastest usable backend wins, then a
+// discrete GPU, then NVIDIA, whatever the enumeration order (a hybrid laptop lists its integrated GPU too, often
+// first when Windows prefers power saving). DLSS5VK_DEVICE=<index or part of the name> restricts the devices,
+// DLSS5VK_BACKEND the backends. When none qualifies, the error names what each device lacks for each backend.
+// auto refuses to fall back from the native route on a GPU with FP8 tensor cores (a driver problem).
+struct DeviceChoice {
+  VkPhysicalDevice physical = VK_NULL_HANDLE;
+  Backend backend = Backend::Native;
+  std::string reason;   // why this backend
+  std::string report;   // one line per device
+};
+DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& extraExtensions = {});
+
+// A device created elsewhere (a renderer, a game integration) for the NR kernels to adopt. `createInfo` is what it
+// was created with: the backend's extensions and features must have been enabled there (a DeviceRequirements chain
+// in its pNext does that), which Context checks instead of trusting what the GPU merely supports.
+struct BorrowedDevice {
+  VkInstance instance = VK_NULL_HANDLE;
+  VkPhysicalDevice physical = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  uint32_t queueFamily = 0;
+  uint32_t queueIndex = 0;
+  Backend backend = Backend::Native;
+  const VkDeviceCreateInfo* createInfo = nullptr;   // only read during the constructor
 };
 
 class Context {
  public:
-  Context();
-  // Adopt a device created elsewhere (the demo renderer) with DeviceRequirements applied; the instance / device
-  // are not destroyed by this object.
-  Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex = 0);
+  Context();   // its own instance and device, on selectDevice's choice
+  // Adopt a device created elsewhere; the instance / device are not destroyed by this object.
+  explicit Context(const BorrowedDevice& borrowed);
   ~Context();
   uint32_t queueFamily() const { return queueFamily_; }
   uint32_t queueIndex() const { return queueIndex_; }
@@ -96,7 +138,9 @@ class Context {
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const { return deviceName_; }
-  bool nativeFp8() const { return nativeFp8_; }
+  Backend backend() const { return backend_; }
+  bool nativeFp8() const { return backend_ == Backend::Native; }
+  uint32_t subgroupSize() const { return subgroupSize_; }
 
   // Buffers -----------------------------------------------------------------
   Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
@@ -167,10 +211,13 @@ class Context {
   uint32_t maxSharedMemory_ = 0;
   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
   bool captureStatistics_ = false;
-  bool nativeFp8_ = false;
+  uint32_t subgroupSize_ = 0;
+  Backend backend_ = Backend::Native;
+  bool executableProperties_ = false;   // VK_KHR_pipeline_executable_properties enabled (statistics)
   bool owned_ = true;
   std::string deviceName_;
-  void initCommon();   // properties, memory types, command pool, layouts, pools, staging
+  void readDeviceProperties();   // SMs, subgroup, limits, memory types
+  void initCommon();   // command pool, layouts, pools, staging
   Buffer dummy_;
   Buffer staging_;
   std::vector<VkShaderModule> modules_;
