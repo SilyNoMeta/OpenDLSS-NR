@@ -1,6 +1,7 @@
 // dlss5vk: standalone Vulkan DLSS-NR runner.
 //   dlss5vk parity --model <nr model dir> --fixture <fixtures/nr512> [--repeat N] [--shaders <dir>] [--dump <dir>]
 //   dlss5vk bench  --model <nr model dir> --width W --height H [--frames N]
+//   dlss5vk image  --model <nr model dir> --input input.rgba-f32 --output output.rgba-f32 --width W --height H
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -612,6 +613,120 @@ int runBench(int argc, char** argv) {
   return 0;
 }
 
+int runImage(int argc, char** argv) {
+  const std::string modelDir = argValue(argc, argv, "--model");
+  const std::string inputPath = argValue(argc, argv, "--input");
+  const std::string outputPath = argValue(argc, argv, "--output");
+  const std::string shaderDir = argValue(argc, argv, "--shaders", executableDirectory(argv[0]) + "/shaders");
+  if (modelDir.empty() || inputPath.empty() || outputPath.empty() || argValue(argc, argv, "--width").empty() ||
+      argValue(argc, argv, "--height").empty()) {
+    fprintf(stderr,
+            "usage: dlss5vk image --model <dir> --input <rgba-f32> --output <rgba-f32> --width W --height H "
+            "[--tone F --structure F --skin F --style 0|1|2 --intensity F --auto-mask 0|1 --seed N --repeat N]\n");
+    return 2;
+  }
+  auto integer = [&](const char* name, const char* fallback, uint64_t low, uint64_t high) {
+    const std::string text = argValue(argc, argv, name, fallback);
+    char* end = nullptr;
+    const unsigned long long value = strtoull(text.c_str(), &end, 10);
+    if (!end || *end || value < low || value > high)
+      throw std::runtime_error(std::string(name) + " must be an integer in [" + std::to_string(low) + ", " +
+                               std::to_string(high) + "]");
+    return (uint32_t)value;
+  };
+  auto number = [&](const char* name, const char* fallback, float low, float high) {
+    const std::string text = argValue(argc, argv, name, fallback);
+    char* end = nullptr;
+    const float value = strtof(text.c_str(), &end);
+    if (!end || *end || !std::isfinite(value) || value < low || value > high)
+      throw std::runtime_error(std::string(name) + " must be a number in [" + std::to_string(low) + ", " +
+                               std::to_string(high) + "]");
+    return value;
+  };
+  const uint32_t width = integer("--width", "0", 33, 16384);
+  const uint32_t height = integer("--height", "0", 33, 16384);
+  const int repeats = (int)integer("--repeat", "1", 1, 16);
+  const uint32_t seed = integer("--seed", "0", 0, UINT32_MAX);
+  const uint32_t autoMaskValue = integer("--auto-mask", "1", 0, 1);
+  const bool autoMask = autoMaskValue != 0;
+  const float tone = number("--tone", "1", 0.0f, 2.0f);
+  const float structure = number("--structure", "1", 0.0f, 2.0f);
+  const float skin = number("--skin", "-1", -1.0f, 2.0f);
+  const float style = number("--style", "0", 0.0f, 2.0f);
+  const float intensity = number("--intensity", "1", 0.0f, 2.0f);
+  if (style != std::floor(style)) throw std::runtime_error("--style must be 0, 1 or 2");
+  const uint64_t inputBytesExpected = (uint64_t)width * height * 4 * sizeof(float);
+  if (inputBytesExpected > SIZE_MAX) throw std::runtime_error("image input is too large");
+  std::vector<uint8_t> inputBytes = readFile(inputPath);
+  if (inputBytes.size() != inputBytesExpected)
+    throw std::runtime_error("image input must be tightly packed RGBA f32: expected " + std::to_string(inputBytesExpected) +
+                             " bytes, got " + std::to_string(inputBytes.size()));
+  const float* input = reinterpret_cast<const float*>(inputBytes.data());
+  for (size_t i = 0; i < (size_t)width * height * 4; ++i) {
+    if (!std::isfinite(input[i])) throw std::runtime_error("image input contains a non-finite value at float " + std::to_string(i));
+    if (input[i] < 0.0f || input[i] > 1.0f)
+      throw std::runtime_error("image input contains a value outside [0, 1] at float " + std::to_string(i));
+  }
+
+  vk::Context context;
+  printf("device: %s\n", context.deviceName().c_str());
+  auto started = std::chrono::steady_clock::now();
+  nr::Model model(context, modelDir, !hasFlag(argc, argv, "--no-verify"));
+  printf("model loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+  nr::Kernels kernels(context, shaderDir);
+  kernels.setSiluTable(ref::siluTable());
+  const nr::Geometry geometry = nr::Geometry::fromValid(width, height);
+  printf("geometry %ux%u -> full %ux%u\n", width, height, geometry.fullWidth, geometry.fullHeight);
+
+  nr::Activation features;
+  features.format = nr::Format::F32;
+  features.rows = geometry.fullWidth * geometry.fullHeight;
+  features.channels = 16;
+  features.allocRows = nr::alignRows(features.rows);
+  features.label = "image input features";
+  features.buffer = context.createBuffer((VkDeviceSize)features.allocRows * features.channels * sizeof(float), false,
+                                         "image input features");
+  context.fillZero(features.buffer);
+  vk::Buffer proxy = context.createBuffer(inputBytes.size(), false, "image proxy");
+  context.upload(proxy, inputBytes.data(), inputBytes.size());
+  nr::Kernels::PreprocessArgs preprocess{geometry.fullWidth, geometry.fullHeight, width, height, width, height, seed,
+                                         autoMask, tone, structure, skin, style};
+  VkCommandBuffer commands = context.beginCommands();
+  kernels.preprocessFromProxy(commands, proxy, features, preprocess);
+  context.endAndSubmit(commands, true);
+
+  GraphRun run = runGraph(context, model, kernels, geometry, features, true, false, repeats);
+  printf("production schedule (%s): %u dispatches, GPU %.3f ms (min of %d)\n",
+         run.chained ? "counter chaining" : "barriers", run.dispatches, run.minGpuMs, repeats);
+  printf("head repeatable: %s; NaN weight codes replaced: %zu\n", run.repeatable ? "yes" : "NO", model.nanWeightsReplaced());
+  if (!run.repeatable) throw std::runtime_error("image head changed across repeated submissions");
+
+  const float* head = reinterpret_cast<const float*>(run.head.data());
+  std::vector<float> output((size_t)width * height * 4);
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const size_t sourcePixel = (size_t)y * width + x;
+      const size_t headPixel = (size_t)y * geometry.fullWidth + x;
+      for (uint32_t c = 0; c < 3; ++c) {
+        const float proxyValue = std::fmin(std::fmax(input[sourcePixel * 4 + c], 0.0f), 1.0f);
+        const float centred = std::fmaf(proxyValue, 0.125f, -0.0625f);
+        const float neural = composed(head[headPixel * 4 + c], centred);
+        output[sourcePixel * 4 + c] =
+            truncateHalf(std::fmin(std::fmax(std::fmaf(intensity, neural - proxyValue, proxyValue), 0.0f), 1.0f));
+      }
+      output[sourcePixel * 4 + 3] = std::fmin(std::fmax(input[sourcePixel * 4 + 3], 0.0f), 1.0f);
+    }
+  }
+  std::ofstream file(outputPath, std::ios::binary);
+  if (!file) throw std::runtime_error("cannot write " + outputPath);
+  file.write(reinterpret_cast<const char*>(output.data()), (std::streamsize)(output.size() * sizeof(float)));
+  if (!file) throw std::runtime_error("failed while writing " + outputPath);
+  printf("wrote %s (%zu bytes, RGBA f32)\n", outputPath.c_str(), output.size() * sizeof(float));
+  context.destroyBuffer(proxy);
+  context.destroyBuffer(features.buffer);
+  return 0;
+}
+
 }  // namespace
 
 int runVerify(int argc, char** argv);
@@ -736,8 +851,9 @@ int runCommand(int argc, char** argv) {
   if (argc >= 2 && !strcmp(argv[1], "shaderinfo")) return runShaderInfo(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "profile")) return runProfile(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "parity")) return runParity(argc, argv);
+  if (argc >= 2 && !strcmp(argv[1], "image")) return runImage(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "bench")) return runBench(argc, argv);
-  fprintf(stderr, "usage: dlss5vk parity|verify|bench|profile|shaderinfo --model <dir> ...\n");
+  fprintf(stderr, "usage: dlss5vk parity|verify|image|bench|profile|shaderinfo --model <dir> ...\n");
   return 2;
 }
 

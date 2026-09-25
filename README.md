@@ -57,6 +57,33 @@ scripts/build_demo.sh
 The interactive demo needs an NVIDIA GPU with a graphics queue and an X11 desktop. Datacenter-only A100/H100
 systems should use the `dlss5vk` compute tool.
 
+### Images
+
+`dlss5vk image` is the raw, dependency-free image path: it accepts and writes tightly packed RGBA f32 files.
+`scripts/enhance_image.py` is the ordinary-image frontend. It uses
+[uv](https://docs.astral.sh/uv/) inline dependencies for Pillow and NumPy, applies EXIF orientation, and reads
+the first frame/page of the input:
+
+```bash
+uv run scripts/enhance_image.py input.jpg output.png --model models/nr
+uv run scripts/enhance_image.py input.png output.webp --size 2048x1152 --passes 2 --quality 95
+```
+
+The frontend exposes the network controls (`--style`, `--intensity`, `--tone`, `--structure`, `--skin`,
+`--auto-mask`, `--seed`) and independent composition controls:
+
+* `--detail-only` keeps the high-frequency part of the NR residual while preserving the source's broad tone;
+* `--tone-preservation 0..1` restores source luminance after NR;
+* `--color-strength 0..1` keeps the generated luminance while blending its chroma toward the source;
+* `--grain-preservation 0..2` restores source high-frequency texture;
+* `--mask mask.png --mask-feather N` limits NR to a grayscale mask, with feathering in output pixels;
+* `--passes 1..4` feeds each generated image through the network again for a stronger cumulative result;
+* `--size WxH` or `--scale F` performs a conventional resize before NR.
+
+PNG, JPEG, WebP, AVIF and TIFF output are selected by extension. Codec availability depends on the Pillow build.
+This is an offline first-frame image path: it does not use temporal history, motion vectors, DLSS Super Resolution,
+Frame Generation or RTX Video.
+
 ### Windows
 
 ```
@@ -72,6 +99,7 @@ build\dlss5vk.exe bench   --model <dir> --width 768 --height 768
 build\dlss5vk.exe profile --model <dir> --width 768 --height 768   # per-dispatch timings
 build\dlss5vk.exe parity  --model <dir> --fixture <dir>            # bit-exactness against a fixture
 build\dlss5vk.exe verify  --model <dir> --fixture <dir>            # block-0 kernel-by-kernel bisect
+build\dlss5vk.exe image   --model <dir> --input in.rgba-f32 --output out.rgba-f32 --width W --height H
 python scripts\ptx\test_fast_divmod.py                             # the PTX divider, over every n < 2^24 (numpy)
 ```
 
