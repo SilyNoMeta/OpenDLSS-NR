@@ -3,9 +3,22 @@
 The NR network running live inside a [Filament](https://github.com/google/filament) frame: real scenes, real
 per-object motion vectors, and the temporal history the network was trained to use.
 
-Windows only. See [Platform support](#platform-support).
+Windows and Linux/X11. See [Platform support](#platform-support).
 
 ## Build and run
+
+Linux:
+
+```bash
+scripts/fetch_tools.sh --npm
+scripts/fetch_filament.sh
+scripts/build_filament.sh
+scripts/build.sh
+scripts/build_demo.sh
+build/demo/dlss5-demo [scene.gltf|.glb [environment.hdr]] --model <nr model dir>
+```
+
+Windows:
 
 ```
 scripts\fetch_tools.ps1 -Npm        # once: the toolchain under tools\ (and the scene converter's npm modules)
@@ -181,9 +194,13 @@ swapchain. The NR work is pre-recorded once per history parity as secondary comm
 
 ## Platform support
 
-Built and verified on Windows only. The macOS pieces (`native_window_cocoa.mm`, the CMake framework list) are
-scaffolding for a later Metal route and have never been compiled. The network's kernels are NVIDIA-only today:
-PTX through `VK_NV_cuda_kernel_launch`, or `VK_KHR_cooperative_matrix` with `VK_EXT_shader_float8`.
+The demo builds on Windows and Linux/X11. It requires an NVIDIA GPU exposing a graphics + compute queue because
+Filament needs a swapchain; compute-only A100/H100 servers can run the top-level `dlss5vk` tool but not the
+interactive demo. The macOS pieces (`native_window_cocoa.mm`, the CMake framework list) remain scaffolding for a
+later Metal route.
+
+Ada and Hopper use native FP8 cooperative matrices and PTX. Ampere A100 uses the slower software-E4M3
+compatibility path in the compute tool; fused kernels and PTX are disabled automatically.
 
 ## Verifying the motion vectors
 

@@ -1,0 +1,124 @@
+#version 460
+// Scalar 8x8 window attention for GPUs without native FP8 matrix instructions.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Push {
+  uint width;
+  uint height;
+  uint channels;
+  uint heads;
+  uint shiftX;
+  uint shiftY;
+  uint windowsX;
+  uint windowCount;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };
+layout(std430, binding = 1) readonly buffer Prior { float16_t prior[]; };
+layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; };
+
+shared uint8_t qs[64 * 32];
+shared uint8_t ks[64 * 32];
+shared uint8_t vs[64 * 32];
+shared float16_t scores[64 * 64];
+shared uint8_t weights[64 * 64];
+
+uint inverseTiledToken(uint token) {
+  uint tile = token >> 4u, within = token & 15u;
+  uint x = (tile & 1u) * 4u + (within & 3u);
+  uint y = (tile >> 1u) * 4u + (within >> 2u);
+  return y * 8u + x;
+}
+
+float16_t expWeight(float16_t score) {
+  precise float affine32 = fma(float(score), 0.044921875, 1.30078125);
+  float16_t affine = clamp(float16_t(affine32), float16_t(1.03125), float16_t(1.5693359375));
+  return f16FromBits(((f16Bits(affine) << 5u) + 0x8000u) & 0xffffu);
+}
+
+float16_t softmaxPair(uint row, uint pair, uint parity) {
+  uint key = pair * 2u + parity;
+  precise float16_t a = scores[row * 64u + key] + scores[row * 64u + key + 8u];
+  precise float16_t b = scores[row * 64u + key + 16u] + scores[row * 64u + key + 24u];
+  precise float16_t c = scores[row * 64u + key + 32u] + scores[row * 64u + key + 40u];
+  precise float16_t d = scores[row * 64u + key + 48u] + scores[row * 64u + key + 56u];
+  precise float16_t ab = a + b;
+  precise float16_t abc = ab + c;
+  return abc + d;
+}
+
+float16_t softmaxSum(uint row) {
+  precise float16_t e0 = softmaxPair(row, 0u, 0u) + softmaxPair(row, 1u, 0u);
+  precise float16_t e1 = e0 + softmaxPair(row, 2u, 0u);
+  precise float16_t even = e1 + softmaxPair(row, 3u, 0u);
+  precise float16_t o0 = softmaxPair(row, 0u, 1u) + softmaxPair(row, 1u, 1u);
+  precise float16_t o1 = o0 + softmaxPair(row, 2u, 1u);
+  precise float16_t odd = o1 + softmaxPair(row, 3u, 1u);
+  return even + odd;
+}
+
+void main() {
+  uint thread = gl_LocalInvocationID.x;
+  uint head = gl_WorkGroupID.x;
+  uint window = gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u;
+  if (window >= pc.windowCount) return;
+  int windowX = int((window % pc.windowsX) * 8u) - int(pc.shiftX);
+  int windowY = int((window / pc.windowsX) * 8u) - int(pc.shiftY);
+  uint stride3 = pc.channels * 3u;
+  uint headBase = head * 96u;
+
+  for (uint i = thread; i < 64u * 32u; i += 128u) {
+    uint token = i >> 5u, component = i & 31u;
+    int qx = windowX + int(token & 7u), qy = windowY + int(token >> 3u);
+    qs[i] = (qx >= 0 && qy >= 0 && qx < int(pc.width) && qy < int(pc.height))
+                ? qkv[(uint(qy) * pc.width + uint(qx)) * stride3 + headBase + component]
+                : uint8_t(0);
+    uint keyLocal = inverseTiledToken(token);
+    int kx = windowX + int(keyLocal & 7u), ky = windowY + int(keyLocal >> 3u);
+    uint8_t k = uint8_t(0), v = uint8_t(0);
+    if (kx >= 0 && ky >= 0 && kx < int(pc.width) && ky < int(pc.height)) {
+      uint base = (uint(ky) * pc.width + uint(kx)) * stride3 + headBase;
+      k = qkv[base + 32u + component];
+      v = qkv[base + 64u + component];
+    }
+    ks[i] = k;
+    vs[i] = v;
+  }
+  barrier();
+
+  for (uint i = thread; i < 64u * 64u; i += 128u) {
+    uint query = i >> 6u, key = i & 63u;
+    precise float16_t value = prior[head * 4096u + i];
+    for (uint c = 0u; c < 32u; ++c)
+      value = fma(float16_t(e4m3ToF32(uint(qs[query * 32u + c]))),
+                  float16_t(e4m3ToF32(uint(ks[key * 32u + c]))), value);
+    scores[i] = expWeight(value);
+  }
+  barrier();
+
+  if (thread < 64u) {
+    float16_t reciprocal = float16_t(1.0 / float(softmaxSum(thread)));
+    for (uint key = 0u; key < 64u; ++key) {
+      precise float16_t normalized = scores[thread * 64u + key] * reciprocal;
+      weights[thread * 64u + key] = uint8_t(e4m3CodeFromF16Bits(f16Bits(normalized)));
+    }
+  }
+  barrier();
+
+  for (uint i = thread; i < 64u * 32u; i += 128u) {
+    uint query = i >> 5u, component = i & 31u;
+    precise float16_t value = float16_t(0.0);
+    for (uint key = 0u; key < 64u; ++key)
+      value = fma(float16_t(e4m3ToF32(uint(weights[query * 64u + key]))),
+                  float16_t(e4m3ToF32(uint(vs[key * 32u + component]))), value);
+    int qx = windowX + int(query & 7u), qy = windowY + int(query >> 3u);
+    if (qx >= 0 && qy >= 0 && qx < int(pc.width) && qy < int(pc.height)) {
+      uint outputIndex = (uint(qy) * pc.width + uint(qx)) * pc.channels + head * 32u + component;
+      attended[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+    }
+  }
+}

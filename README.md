@@ -33,6 +33,32 @@ describes the model in its report,
 
 ## Build and run
 
+### Linux
+
+```bash
+scripts/fetch_tools.sh                 # once: pinned glslang, Vulkan headers, volk, CMake and Ninja
+scripts/build.sh                       # shaders, PTX and build/dlss5vk
+./build/dlss5vk bench --model <dir> --width 768 --height 768
+```
+
+The build uses the Vulkan loader supplied by the NVIDIA driver; no Vulkan SDK is required. `GLSLANG`, `PYTHON`,
+`CMAKE` and `NINJA` can override the tools selected by the shell scripts. `scripts/fetch_tools.sh --npm` also
+installs the scene converter's npm dependencies.
+
+For the optional Filament demo:
+
+```bash
+scripts/fetch_filament.sh
+scripts/build_filament.sh              # requires clang/clang++
+scripts/build_demo.sh
+./build/demo/dlss5-demo --model <dir>
+```
+
+The interactive demo needs an NVIDIA GPU with a graphics queue and an X11 desktop. Datacenter-only A100/H100
+systems should use the `dlss5vk` compute tool.
+
+### Windows
+
 ```
 powershell -File scripts\fetch_tools.ps1 [-Npm]     # once: tools\ (glslang, Vulkan-Headers, volk, CMake, Ninja)
 powershell -File scripts\build.ps1                  # shaders, PTX, build\dlss5vk.exe
@@ -83,18 +109,33 @@ network's history input lanes and its per-pixel blend logit drive a reprojected 
 ([docs/frame.md](docs/frame.md)). The `dlss5vk` tool runs single frames with no history, which is what the
 reference captures were made with.
 
+## GPU support
+
+| GPU | Backend | Notes |
+| --- | --- | --- |
+| NVIDIA Ada (RTX 40) | Native FP8 Vulkan + PTX | Reference performance and bit-exact path. |
+| NVIDIA Hopper (H100) | Native FP8 Vulkan + PTX | Automatically selected when the driver exposes the FP8 cooperative-matrix extensions. |
+| NVIDIA Ampere (A100) | Software E4M3 Vulkan compute | Automatically selected without FP8 extensions. Uses the same model format, but is substantially slower and is not expected to be bit-exact with the native FP8 path. |
+
+The A100 compatibility backend keeps E4M3 storage and performs E4M3 decode, f16 arithmetic and quantization in
+ordinary compute shaders. Fused kernels, PTX launches and barrier-free chaining are disabled automatically.
+
 ## Requirements
 
-- Windows, an NVIDIA Ada (or newer) GPU and a driver exposing `VK_KHR_cooperative_matrix`,
-  `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8` and `VK_NV_cuda_kernel_launch`.
-- Visual Studio 2022 or later with the C++ x64 toolset (any edition or the Build Tools; found through vswhere,
+- Linux x86_64 or Windows, an NVIDIA Vulkan driver, and an Ada, Hopper, or Ampere datacenter GPU as described
+  above. H100 requires a driver exposing `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`,
+  `VK_EXT_shader_float8` and `VK_NV_cuda_kernel_launch` for the native path.
+- Linux: `git`, `curl`, Python 3 and a C++20 compiler. The pinned CMake, Ninja, glslang, Vulkan headers and volk
+  are installed under `tools/` by `scripts/fetch_tools.sh`. The demo additionally needs clang, X11 development
+  libraries, and the Xext, Xcursor, Xi, Xfixes, Xrandr and Xss development libraries.
+- Windows: Visual Studio 2022 or later with the C++ x64 toolset (any edition or the Build Tools; found through vswhere,
   or set `VCVARS64` to your `vcvars64.bat`), git, Python 3 for the PTX generators, and Node.js + npm and
   Pillow for the scene converter.
 - The portable toolchain under `tools/` (git-ignored): `scripts\fetch_tools.ps1` downloads glslang 16.6.0,
   Vulkan-Headers v1.4.363, volk (pinned tags), CMake 3.31 and Ninja 1.13. No Vulkan SDK install is needed.
   `-Npm` also installs the scene converter's modules into `tools\gltf`.
-- For the demo: Filament v1.77.0, cloned and patched by `scripts\fetch_filament.ps1` and built once by
-  `scripts\build_filament.ps1` (both git-ignored; about 15 minutes and 6 GB of build tree, placed in
+- For the demo: Filament v1.77.0, cloned and patched by the platform's `fetch_filament` script and built once by
+  its `build_filament` script (git-ignored; about 15 minutes and 6 GB of build tree; on Windows it is placed in
   `%LOCALAPPDATA%\dlss5-vulkan` or `DLSS5_FILAMENT_BUILD_DIR`; `DLSS5_BUILD_JOBS` caps the parallel
   compiles, default 8, because MSVC takes up to a GB per job on Filament).
 

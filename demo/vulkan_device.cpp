@@ -13,6 +13,32 @@ namespace {
 // DLSS5_DEMO_VALIDATION=1: the Khronos validation layer (needs a Vulkan SDK) with a debug messenger
 bool wantsValidation() { return getenv("DLSS5_DEMO_VALIDATION") != nullptr; }
 
+bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const char* name) {
+  for (const auto& extension : extensions) if (!strcmp(extension.extensionName, name)) return true;
+  return false;
+}
+
+bool hasNativeFp8(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions) {
+  if (!hasExtension(extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME))
+    return false;
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+  VkPhysicalDeviceCooperativeMatrix2FeaturesNV coop2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
+  VkPhysicalDeviceShaderFloat8FeaturesEXT fp8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+  VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  features.pNext = &fp8;
+  fp8.pNext = &coop2;
+  coop2.pNext = &coop;
+  vkGetPhysicalDeviceFeatures2(physical, &features);
+  return coop.cooperativeMatrix && fp8.shaderFloat8 && fp8.shaderFloat8CooperativeMatrix &&
+         coop2.cooperativeMatrixWorkgroupScope && coop2.cooperativeMatrixFlexibleDimensions &&
+         coop2.cooperativeMatrixReductions && coop2.cooperativeMatrixConversions &&
+         coop2.cooperativeMatrixPerElementOperations && coop2.cooperativeMatrixTensorAddressing &&
+         coop2.cooperativeMatrixBlockLoads;
+}
+
 VkBool32 VKAPI_PTR debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
                                  const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
   if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT))
@@ -33,7 +59,6 @@ VulkanDevice::VulkanDevice() {
   instanceExtensions.push_back("VK_EXT_metal_surface");
   instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 #else
-  instanceExtensions.push_back("VK_KHR_xcb_surface");
   instanceExtensions.push_back("VK_KHR_xlib_surface");
 #endif
   const bool validation = wantsValidation();
@@ -79,20 +104,22 @@ VulkanDevice::VulkanDevice() {
   VK_CHECK(vkEnumeratePhysicalDevices(instance, &count, nullptr));
   std::vector<VkPhysicalDevice> devices(count);
   VK_CHECK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
-  vk::DeviceRequirements requirements;
+  bool nativeFp8 = false;
   VkPhysicalDevice physical = VK_NULL_HANDLE;
+  VkPhysicalDevice compatibility = VK_NULL_HANDLE;
   for (VkPhysicalDevice candidate : devices) {
     uint32_t extensionCount = 0;
     vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr);
     std::vector<VkExtensionProperties> extensions(extensionCount);
     vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, extensions.data());
-    size_t found = 0;
-    for (const char* wanted : requirements.extensions)
-      for (const auto& extension : extensions)
-        if (!strcmp(extension.extensionName, wanted)) { found++; break; }
-    if (found == requirements.extensions.size()) { physical = candidate; break; }
+    VkPhysicalDeviceProperties candidateProperties{};
+    vkGetPhysicalDeviceProperties(candidate, &candidateProperties);
+    if (hasNativeFp8(candidate, extensions)) { physical = candidate; nativeFp8 = true; break; }
+    if (!compatibility && candidateProperties.vendorID == 0x10de) compatibility = candidate;
   }
-  if (!physical) throw std::runtime_error("no Vulkan device with the NR kernels' extensions (cooperative matrices, fp8, CUDA kernel launch)");
+  if (!physical) physical = compatibility;
+  if (!physical) throw std::runtime_error("no NVIDIA Vulkan device");
+  vk::DeviceRequirements requirements(nativeFp8);
   VkPhysicalDeviceProperties properties;
   vkGetPhysicalDeviceProperties(physical, &properties);
   deviceName_ = properties.deviceName;
@@ -150,7 +177,8 @@ VulkanDevice::VulkanDevice() {
   handles_.rendererQueueIndex = 0;
   handles_.nrQueueIndex = queueCount - 1;
   handles_.debugUtils = validation;
-  fprintf(stderr, "[vk] %s, queue family %u (%u queue%s)\n", deviceName_.c_str(), family, queueCount, queueCount > 1 ? "s" : "");
+  fprintf(stderr, "[vk] %s, %s, queue family %u (%u queue%s)\n", deviceName_.c_str(),
+          nativeFp8 ? "native FP8" : "software E4M3 compatibility", family, queueCount, queueCount > 1 ? "s" : "");
 }
 
 VulkanDevice::~VulkanDevice() {

@@ -141,8 +141,12 @@ Graph::Routes Graph::routesFromEnvironment() {
 }
 
 Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options)
-    : context_(context), model_(model), kernels_(kernels), geometry_(geometry), options_(options),
-      routes_(routesFromEnvironment()) {
+    : routes_(routesFromEnvironment()), context_(context), model_(model), kernels_(kernels), geometry_(geometry),
+      options_(options) {
+  if (!context_.nativeFp8()) {
+    options_.fusedBlocks = false;
+    routes_.fusePre = routes_.fusePool = routes_.fuseUpres = routes_.fusePost = false;
+  }
   // Chaining links consecutive PTX launches through device counters and drops the barrier between them, so every
   // launch in the chain must take its PTX route. Any switch that sends one kernel family (or one fused block)
   // back to GLSL takes the whole graph back to barriers.

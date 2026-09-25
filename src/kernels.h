@@ -210,13 +210,13 @@ class Kernels {
   // w2 tile-major [e][4][32][32], w3 tile-major [K/32][K][32].
   static bool ptxFfnEnabled();
   static uint32_t ffnRowTiles(uint32_t channels);          // PTX expert FFN: 16-row tiles per workgroup (its chaining signals cover 16 * tiles rows)
-  void expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& args, const Chain& chain = Chain());
+  void expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& args, const Chain& chain);
 
   // Fused QKV projection + normalize + attention (qkv_attention.comp): E4 input in, E4 attended out.
   void qkvAttention(VkCommandBuffer commands, const Activation& input, const vk::Buffer& weights, uint32_t Nmatrix,
                     const Tensor& tensor, uint32_t scaleByteOffset, const vk::Buffer& prior, Activation& attended,
                     uint32_t width, uint32_t height, uint32_t heads, uint32_t shiftX, uint32_t shiftY,
-                    const Chain& chain = Chain());
+                    const Chain& chain);
   void windowNormalize(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor,
                        uint32_t scaleByteOffset, Activation& normalized, uint32_t tokens, uint32_t heads);
   void windowAttend(VkCommandBuffer commands, const Activation& normalized, const vk::Buffer& prior,

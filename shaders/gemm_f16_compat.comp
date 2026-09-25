@@ -1,0 +1,33 @@
+#version 460
+// Scalar f16 GEMM used by the compatibility backend.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint K = 16;
+layout(constant_id = 1) const uint PADDED_N = 32;
+layout(constant_id = 2) const uint FLAGS = 0;
+const uint F_QUANTIZE = 16u;
+const uint F_DUAL = 32u;
+const uint F_OUT_F32 = 256u;
+
+layout(push_constant) uniform Push { uint rows; uint N; uint inputStride; uint outputStride; } pc;
+layout(std430, binding = 0) readonly buffer InputA { float16_t a[]; };
+layout(std430, binding = 1) readonly buffer InputB { float16_t b[]; };
+layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t out16[]; };
+layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t out8[]; };
+layout(std430, binding = 7) writeonly buffer OutputFloat { float out32[]; };
+
+void main() {
+  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+  if (id >= pc.rows * pc.N) return;
+  uint row = id / pc.N, column = id % pc.N;
+  precise float16_t value = float16_t(0.0);
+  for (uint k = 0u; k < K; ++k) value = fma(a[row * pc.inputStride + k], b[k * PADDED_N + column], value);
+  uint outputIndex = row * pc.outputStride + column;
+  if ((FLAGS & F_OUT_F32) != 0u) out32[outputIndex] = float(value);
+  else if ((FLAGS & F_QUANTIZE) != 0u) out8[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+  else out16[outputIndex] = value;
+  if ((FLAGS & F_DUAL) != 0u) out8[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+}

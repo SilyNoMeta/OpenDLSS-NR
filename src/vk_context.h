@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,7 +67,7 @@ struct DeviceRequirements {
   VkPhysicalDeviceShaderSMBuiltinsFeaturesNV sm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV};
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
   std::vector<const char*> extensions;
-  DeviceRequirements();                       // fills the chain (features.pNext -> ...) and the extension list
+  explicit DeviceRequirements(bool nativeFp8 = true);  // fills the chain and extension list for the selected backend
   void* pNextChain() { return features.pNext; }   // for a VkDeviceCreateInfo that carries VkPhysicalDeviceFeatures itself
 };
 
@@ -95,6 +96,7 @@ class Context {
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const { return deviceName_; }
+  bool nativeFp8() const { return nativeFp8_; }
 
   // Buffers -----------------------------------------------------------------
   Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
@@ -165,6 +167,7 @@ class Context {
   uint32_t maxSharedMemory_ = 0;
   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
   bool captureStatistics_ = false;
+  bool nativeFp8_ = false;
   bool owned_ = true;
   std::string deviceName_;
   void initCommon();   // properties, memory types, command pool, layouts, pools, staging

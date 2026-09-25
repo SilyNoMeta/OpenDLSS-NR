@@ -1,0 +1,71 @@
+#version 460
+// Portable E4M3 GEMM for GPUs without native FP8 cooperative matrices (for example A100).
+// One invocation computes one output element. This is a compatibility path, not a performance path.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 0) const uint K = 32;
+layout(constant_id = 2) const uint FLAGS = 0;
+
+const uint F_RESIDUAL = 1u;
+const uint F_SCALE_RESIDUAL = 2u;
+const uint F_SILU = 8u;
+const uint F_QUANTIZE = 16u;
+const uint F_DUAL = 32u;
+const uint F_RESIDUAL_E4 = 64u;
+const uint F_BROADCAST_INPUT = 128u;
+
+layout(push_constant) uniform Push {
+  uint rows;
+  uint N;
+  uint Nmatrix;
+  uint weightColumnOffset;
+  uint inputStride;
+  uint inputColumnBase;
+  uint outputStride;
+  uint outputColumnOffset;
+  uint auxHalfOffset;
+  uint batches;
+} pc;
+
+layout(std430, binding = 0) readonly buffer InputA { uint8_t inputE4[]; };
+layout(std430, binding = 1) readonly buffer InputB { uint8_t weightsE4[]; };
+layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t outputF16[]; };
+layout(std430, binding = 3) readonly buffer ResidualHalf { float16_t residualF16[]; };
+layout(std430, binding = 4) readonly buffer Aux { float16_t auxF16[]; };
+layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t outputE4[]; };
+layout(std430, binding = 6) readonly buffer ResidualE4 { uint8_t residualE4[]; };
+
+void main() {
+  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+  uint count = pc.rows * pc.batches * pc.N;
+  if (id >= count) return;
+  uint column = id % pc.N;
+  uint batch = (id / pc.N) % pc.batches;
+  uint row = id / (pc.N * pc.batches);
+  uint inputBase = row * pc.inputStride + pc.inputColumnBase +
+                   (((FLAGS & F_BROADCAST_INPUT) != 0u) ? 0u : batch * K);
+  precise float16_t value = float16_t(0.0);
+  if ((FLAGS & F_RESIDUAL) != 0u) {
+    uint residualIndex = row * pc.outputStride + pc.outputColumnOffset + batch * pc.N + column;
+    value = (FLAGS & F_RESIDUAL_E4) != 0u
+                ? float16_t(e4m3ToF32(uint(residualE4[residualIndex])))
+                : residualF16[residualIndex];
+    if ((FLAGS & F_SCALE_RESIDUAL) != 0u) value = value * auxF16[pc.auxHalfOffset + column];
+  }
+  for (uint k = 0u; k < K; ++k) {
+    uint weight = (((batch * (K / 32u) + k / 32u) * pc.Nmatrix +
+                    pc.weightColumnOffset + column) * 32u) + (k & 31u);
+    float16_t a = float16_t(e4m3ToF32(uint(inputE4[inputBase + k])));
+    float16_t b = float16_t(e4m3ToF32(uint(weightsE4[weight])));
+    value = fma(a, b, value);
+  }
+  if ((FLAGS & F_SILU) != 0u) value = siluHalf(value);
+  uint outputIndex = row * pc.outputStride + pc.outputColumnOffset + batch * pc.N + column;
+  if ((FLAGS & F_QUANTIZE) == 0u) outputF16[outputIndex] = value;
+  if ((FLAGS & (F_QUANTIZE | F_DUAL)) != 0u)
+    outputE4[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+}

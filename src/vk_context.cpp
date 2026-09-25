@@ -17,6 +17,32 @@ bool envFlag(const char* name) {
   return value && *value && strcmp(value, "0") != 0;
 }
 
+bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const char* name) {
+  return std::any_of(extensions.begin(), extensions.end(),
+                     [name](const VkExtensionProperties& extension) { return !strcmp(extension.extensionName, name); });
+}
+
+bool supportsNativeFp8(VkPhysicalDevice physical, const std::vector<VkExtensionProperties>& extensions) {
+  if (!hasExtension(extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) ||
+      !hasExtension(extensions, VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME))
+    return false;
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+  VkPhysicalDeviceCooperativeMatrix2FeaturesNV coop2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
+  VkPhysicalDeviceShaderFloat8FeaturesEXT fp8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+  VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  features.pNext = &fp8;
+  fp8.pNext = &coop2;
+  coop2.pNext = &coop;
+  vkGetPhysicalDeviceFeatures2(physical, &features);
+  return coop.cooperativeMatrix && fp8.shaderFloat8 && fp8.shaderFloat8CooperativeMatrix &&
+         coop2.cooperativeMatrixWorkgroupScope && coop2.cooperativeMatrixFlexibleDimensions &&
+         coop2.cooperativeMatrixReductions && coop2.cooperativeMatrixConversions &&
+         coop2.cooperativeMatrixPerElementOperations && coop2.cooperativeMatrixTensorAddressing &&
+         coop2.cooperativeMatrixBlockLoads;
+}
+
 VkBool32 VKAPI_PTR onDebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT type,
                                   const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
   if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && (type & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
@@ -29,7 +55,7 @@ VkBool32 VKAPI_PTR onDebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severit
 uint32_t Context::validationErrors() { return g_validationErrors.load(); }
 
 Context::Context() {
-  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
+  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("the Vulkan loader is unavailable");
 
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   app.pApplicationName = "dlss5-vulkan";
@@ -71,23 +97,25 @@ Context::Context() {
   if (!count) throw std::runtime_error("no Vulkan physical devices");
   std::vector<VkPhysicalDevice> devices(count);
   VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, devices.data()));
-  // Prefer a discrete device exposing FP8 cooperative matrices.
+  // Prefer native FP8 (Ada / Hopper), then accept an NVIDIA device for the software-E4M3 compatibility path.
+  VkPhysicalDevice compatibility = VK_NULL_HANDLE;
   for (VkPhysicalDevice candidate : devices) {
     uint32_t extensionCount = 0;
     vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr);
     std::vector<VkExtensionProperties> extensions(extensionCount);
     vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, extensions.data());
-    bool coop = false, fp8 = false;
+    VkPhysicalDeviceProperties candidateProperties{};
+    vkGetPhysicalDeviceProperties(candidate, &candidateProperties);
     for (const auto& extension : extensions) {
-      if (!strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) coop = true;
-      if (!strcmp(extension.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) fp8 = true;
       if (getenv("DLSS5VK_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
         printf("  device extension: %s (v%u)\n", extension.extensionName, extension.specVersion);
     }
-    if (coop && fp8) { physical_ = candidate; break; }
+    if (supportsNativeFp8(candidate, extensions)) { physical_ = candidate; nativeFp8_ = true; break; }
+    if (!compatibility && candidateProperties.vendorID == 0x10de) compatibility = candidate;
   }
-  if (!physical_) throw std::runtime_error("no device with VK_KHR_cooperative_matrix + VK_EXT_shader_float8");
-  if (getenv("DLSS5VK_LIST_EXTENSIONS")) {
+  if (!physical_) physical_ = compatibility;
+  if (!physical_) throw std::runtime_error("no NVIDIA Vulkan device");
+  if (getenv("DLSS5VK_LIST_EXTENSIONS") && nativeFp8_) {
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &cm2;
@@ -150,7 +178,7 @@ Context::Context() {
   queueInfo.queueCount = 1;
   queueInfo.pQueuePriorities = &priority;
 
-  DeviceRequirements req;
+  DeviceRequirements req(nativeFp8_);
   VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   deviceInfo.pNext = &req.features;
   deviceInfo.queueCreateInfoCount = 1;
@@ -159,14 +187,20 @@ Context::Context() {
   deviceInfo.ppEnabledExtensionNames = req.extensions.data();
   VK_CHECK(vkCreateDevice(physical_, &deviceInfo, nullptr, &device_));
   volkLoadDevice(device_);
+  fprintf(stderr, "backend: %s\n", nativeFp8_ ? "native FP8 (Ada/Hopper)" : "software E4M3 compatibility (Ampere)");
   initCommon();
 }
 
 Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex) {
-  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
+  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("the Vulkan loader is unavailable");
   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
   volkLoadInstance(instance_);
   volkLoadDevice(device_);
+  uint32_t extensionCount = 0;
+  vkEnumerateDeviceExtensionProperties(physical_, nullptr, &extensionCount, nullptr);
+  std::vector<VkExtensionProperties> extensions(extensionCount);
+  vkEnumerateDeviceExtensionProperties(physical_, nullptr, &extensionCount, extensions.data());
+  nativeFp8_ = supportsNativeFp8(physical_, extensions);
   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
   VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
@@ -181,7 +215,7 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
   initCommon();
 }
 
-DeviceRequirements::DeviceRequirements() {
+DeviceRequirements::DeviceRequirements(bool nativeFp8) {
   f11.storageBuffer16BitAccess = VK_TRUE;
   f11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
   f12.pNext = &f11;
@@ -198,43 +232,46 @@ DeviceRequirements::DeviceRequirements() {
   f13.computeFullSubgroups = VK_TRUE;
   f13.synchronization2 = VK_TRUE;
   f13.maintenance4 = VK_TRUE;   // LocalSizeId: gemm_fp8.comp takes its workgroup size from a specialization constant
-  coop.pNext = &f13;
-  coop.cooperativeMatrix = VK_TRUE;
-  coop2.pNext = &coop;
-  coop2.cooperativeMatrixWorkgroupScope = VK_TRUE;
-  coop2.cooperativeMatrixFlexibleDimensions = VK_TRUE;
-  coop2.cooperativeMatrixReductions = VK_TRUE;
-  coop2.cooperativeMatrixConversions = VK_TRUE;
-  coop2.cooperativeMatrixPerElementOperations = VK_TRUE;
-  coop2.cooperativeMatrixTensorAddressing = VK_TRUE;
-  coop2.cooperativeMatrixBlockLoads = VK_TRUE;
-  fp8.pNext = &coop2;
-  fp8.shaderFloat8 = VK_TRUE;
-  fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
-  features.pNext = &fp8;
+  features.pNext = &f13;
   features.features.shaderInt16 = VK_TRUE;
   features.features.shaderInt64 = VK_TRUE;
   // robustBufferAccess stays off (15% cost, masks bugs); experiment shaders must check their own ranges.
   features.features.robustBufferAccess = VK_FALSE;
 
-  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR& executableFeatures = executable;
-  executableFeatures.pipelineExecutableInfo = VK_TRUE;
-  executableFeatures.pNext = features.pNext;
-  features.pNext = &executableFeatures;
-  // Shader clocks (clockARB / clockRealtimeEXT).
-  VkPhysicalDeviceShaderClockFeaturesKHR& clockFeatures = clock;
-  clockFeatures.shaderSubgroupClock = VK_TRUE;
-  clockFeatures.shaderDeviceClock = VK_TRUE;
-  clockFeatures.pNext = features.pNext;
-  features.pNext = &clockFeatures;
   VkPhysicalDeviceShaderSMBuiltinsFeaturesNV& smFeatures = sm;
   smFeatures.shaderSMBuiltins = VK_TRUE;
   smFeatures.pNext = features.pNext;
   features.pNext = &smFeatures;
-  extensions = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-                              VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME,
-                              VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
-                              VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME};
+  extensions = {VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME};
+  if (nativeFp8) {
+    coop.cooperativeMatrix = VK_TRUE;
+    coop.pNext = features.pNext;
+    features.pNext = &coop;
+    coop2.cooperativeMatrixWorkgroupScope = VK_TRUE;
+    coop2.cooperativeMatrixFlexibleDimensions = VK_TRUE;
+    coop2.cooperativeMatrixReductions = VK_TRUE;
+    coop2.cooperativeMatrixConversions = VK_TRUE;
+    coop2.cooperativeMatrixPerElementOperations = VK_TRUE;
+    coop2.cooperativeMatrixTensorAddressing = VK_TRUE;
+    coop2.cooperativeMatrixBlockLoads = VK_TRUE;
+    coop2.pNext = features.pNext;
+    features.pNext = &coop2;
+    fp8.shaderFloat8 = VK_TRUE;
+    fp8.shaderFloat8CooperativeMatrix = VK_TRUE;
+    fp8.pNext = features.pNext;
+    features.pNext = &fp8;
+    executable.pipelineExecutableInfo = VK_TRUE;
+    executable.pNext = features.pNext;
+    features.pNext = &executable;
+    clock.shaderSubgroupClock = VK_TRUE;
+    clock.shaderDeviceClock = VK_TRUE;
+    clock.pNext = features.pNext;
+    features.pNext = &clock;
+    extensions.insert(extensions.end(),
+                      {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
+                       VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME,
+                       VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_SHADER_CLOCK_EXTENSION_NAME});
+  }
 }
 
 void Context::initCommon() {
