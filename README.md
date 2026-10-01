@@ -139,20 +139,25 @@ reference captures were made with.
 
 ## GPU support
 
-| GPU | Backend | Notes |
+| GPU | Backend (`DLSS5VK_BACKEND`) | Notes |
 | --- | --- | --- |
-| NVIDIA Ada (RTX 40) | Native FP8 Vulkan + PTX | Reference performance and bit-exact path. |
-| NVIDIA Hopper (H100) | Native FP8 Vulkan + PTX | Automatically selected when the driver exposes the FP8 cooperative-matrix extensions. |
-| NVIDIA Ampere (A100) | Software E4M3 Vulkan compute | Automatically selected without FP8 extensions. Uses the same model format, but is substantially slower and is not expected to be bit-exact with the native FP8 path. |
+| NVIDIA Ada, Blackwell (RTX 40 / 50) | `native`: FP8 cooperative matrices + FP8 PTX | Reference performance and bit-exact path. Selected automatically. |
+| NVIDIA Hopper (H100) | `native` | When the driver exposes the FP8 cooperative-matrix extensions (upstream report, not tested in this fork). |
+| NVIDIA Ampere | `compat`: software E4M3 in scalar GLSL | Validated on RTX 3070 Ti Laptop sm86: 12 WebGPU-derived fixtures bit-exact, CPU block checks and temporal demo. Automatically selected; about 0.65 s per 512x512 network frame. Other Ampere devices need qualification. |
+| NVIDIA Ampere, compute capability 8.0-8.7 | `sm86` (opt-in): PTX lowered to f16 Tensor Cores | Validated on sm86 only: about 14 ms at 512x512 and 75 ms at 1920x1080 for the network. **Experimental and not bit-exact**; numerical deviations and coverage are reported in [RESULTS.md](docs/ampere/RESULTS.md). Visual equivalence is unconfirmed. |
 
-The A100 compatibility backend keeps E4M3 storage and performs E4M3 decode, f16 arithmetic and quantization in
-ordinary compute shaders. Fused kernels, PTX launches and barrier-free chaining are disabled automatically.
+`auto` (the default) takes `native`, else `compat`, prints which and why, and refuses to leave `native` on a GPU of
+compute capability 8.9 or later (a driver too old for the FP8 extensions is a driver problem, not a reason to run
+the slow route). An explicit backend the device cannot run is an error. The Ampere port, its validation and its
+measurements: [docs/ampere/README.md](docs/ampere/README.md).
 
 ## Requirements
 
-- Linux x86_64 or Windows, an NVIDIA Vulkan driver, and an Ada, Hopper, or Ampere datacenter GPU as described
-  above. H100 requires a driver exposing `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`,
-  `VK_EXT_shader_float8` and `VK_NV_cuda_kernel_launch` for the native path.
+- Linux x86_64 or Windows, an NVIDIA Vulkan 1.3 driver and GPU as described above. The native path needs
+  `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8` and `VK_NV_cuda_kernel_launch`;
+  among vendor extensions, `compat` needs `VK_NV_shader_sm_builtins`, and `sm86` adds `VK_NV_cuda_kernel_launch`.
+  All backends also require the core feature bits checked by `vk::DeviceRequirements`, including 8/16-bit storage,
+  integer/half arithmetic, buffer device addresses, the Vulkan memory model and synchronization2.
 - Linux: `git`, `curl`, Python 3 and a C++20 compiler. The pinned CMake, Ninja, glslang, Vulkan headers and volk
   are installed under `tools/` by `scripts/fetch_tools.sh`. The demo additionally needs clang, X11 development
   libraries, and the Xext, Xcursor, Xi, Xfixes, Xrandr and Xss development libraries.
@@ -228,6 +233,9 @@ them is part of the gate. Any switch that sends a kernel back to GLSL also turns
 only the PTX kernels take part in it.
 
 - `DLSS5VK_DEVICE=<index or part of the name>` picks the GPU (see [Laptops](#laptops)).
+- `DLSS5VK_BACKEND=auto|native|compat|sm86` picks the backend (see [GPU support](#gpu-support)). On `sm86`, the
+  PTX directory defaults to `build/ptx_sm86` and counter chaining to off (`DLSS5VK_CHAIN=1` turns it on).
+- `DLSS5VK_CAPTURE_BLOCK=N` (a diagnostic): `parity --dump` also writes block N's intermediate tensors.
 - `DLSS5VK_UNFUSED=1` runs the GLSL reference route, up to 2560x1440: it materializes every intermediate.
 - `DLSS5VK_PTX_DIR` is the PTX directory, default `build/ptx`.
 - `DLSS5VK_CHAIN=0` puts barriers between every launch instead of counter chaining.

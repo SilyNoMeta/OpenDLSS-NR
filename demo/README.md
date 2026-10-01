@@ -54,10 +54,22 @@ The window can be resized; the network re-fits to the new size.
 - `--frames N --capture prefix` is the scripted run: it captures at frames 40, 100, 160 and 200 of a
   static, orbit, settle, NR-off sequence, and dumps the raw scene and velocity buffers at frames 99 and 100 and
   the unpacked motion (with its history flag) at 100. `--orbit deg` yaws the camera by that much per frame from
-  frame 40.
+  frame 40. The scripted run steps animations at a fixed 60 Hz, so two runs (two backends) render the same frames.
+  `--resize-at frame,WxH` also resizes the window at that frame (captures `pre-resize` and, 30 frames later,
+  `resized`). The sequence also resets history at 120 and captures the first frame after reset, disable,
+  re-enable and resize. Each capture writes local raw scene/motion/head/features/history data and frame metadata.
+  `python scripts/verify_demo.py <prefix>` checks reprojection and history against CPU calculations;
+  `--compare <second-prefix>` first requires identical renderer inputs and compares the histories.
 - `DLSS5_DEMO_VALIDATION=1` enables the Khronos validation layer and refuses to start without it (a Vulkan SDK, or
-  `VK_LAYER_PATH` at a build of Vulkan-ValidationLayers; `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` adds
-  synchronization validation). The NR pass runs clean under both; the remaining messages are Filament's.
+  `VK_LAYER_PATH` at a build of Vulkan-ValidationLayers). This also enables synchronization validation;
+  any validation error fails the run. The sm86 qualifications are in [RESULTS.md](../docs/ampere/RESULTS.md).
+  Filament emits vertex-attribute performance warnings on this machine; they are distinct from validation errors.
+
+On Ampere, `DLSS5VK_BACKEND=compat` runs the reference shaders; `sm86` opts into the experimental Tensor Core
+path. Both have been tested with the skinned Fox, resets and irregular resize. The Filament patch now retains
+graphics pipelines until their submission fences finish, including during skipped frames, and invalidates its
+binding cache after Vulkan interop. NR graph buffers have explicit dependencies between frames. Captures and
+scene/model data stay outside Git. Do not benchmark another GPU session concurrently.
 
 ## Scenes
 

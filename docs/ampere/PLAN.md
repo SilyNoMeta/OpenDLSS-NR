@@ -54,14 +54,13 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
 
 ## 5. Optimized sm86 route
 
-- [x] measured: Ampere f16 HMMA (m16n8k16) on decoded E4M3 equals Ada's F13 group in 74.6% of groups with an f16
-      accumulator, 90.3% with an f32 accumulator and an RN publication per group; so this route is a tolerance
-      route, not a bit-exact one
+- [x] Ampere f16 HMMA arithmetic differs from F13; the final random operand/accumulator probe gives 54.3% exact
+      results and 100% within its local summation bound. Earlier zero-accumulator experiments are not a full-network claim
 - [x] PTX lowering to sm80 ISA for sm86: two f16 MMAs, exact operand conversion; 78 variants assembled
 - [x] full engine launches through `VK_NV_cuda_kernel_launch`, including dynamic shared memory above 48 KiB
 - [x] barriers default; opt-in chaining compared for repeatability/progress, not enabled automatically
 - [x] composed-output comparisons on six fixtures; sm86 differs and remains experimental
-- [~] performance: final controlled rerun, setup/synchronization/memory report pending
+- [x] controlled AB/BA performance rerun: setup, GPU graph, host submission/wait, memory and profile reported in RESULTS.md
 - [x] backend flags isolated per Kernels instance; concurrent sm86/compat contexts and borrowed enabled-bit checks pass
 
 ## 6. Demo and temporal path
@@ -70,10 +69,12 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
 - [x] compat demo pipeline eviction fixed with submission fences; 250 frames pass synchronization validation without CPU serialization
 - [x] CPU reprojection/history verification on compat and sm86: 160x120 -> 233x137, Fox skinning/camera motion, reset, NR off/on
 - [x] sm86 second 250-frame run: all 11 captured histories byte-identical; renderer inputs identical between backends
-- [~] larger sm86 demo, no-temporal control and final performance/fixture reruns
+- [x] sm86 640x360 -> 800x450 demo and no-temporal control; CPU verifier passes
+- [x] final 12-fixture rerun, CPU block verify, two-backend profiles and conversion/MMA probe pass
+- [x] all 78 PTX variants assemble for sm80 and sm86; Linux script syntax passes (no Linux compiler/runtime qualification)
 
 ## 7. Documentation and delivery
 
-- [~] provenance, backends, build, commands, results, limitations, hardware
-- [~] integration contract drafted; review against final synchronization behavior pending
+- [x] provenance, backends, build/data commands, results, limitations and hardware documented
+- [x] integration contract documents enabled queues/features, synchronization, resources, history and failure status
 - [~] audited pushes to `origin/feat/sm86` (no force-push, no private data, no binaries)
