@@ -1,14 +1,25 @@
 #version 460
-// Portable E4M3 GEMM for GPUs without native FP8 cooperative matrices (for example A100).
-// One invocation computes one output element. This is a compatibility path, not a performance path.
+// E4M3 GEMM for GPUs without FP8 cooperative matrices (the compatibility backend): the same function as
+// gemm_fp8.comp, bit for bit, with the tensor-core step emulated in integer code (exact_mma.glsl).
+//
+// D = A(E4M3, rows x K) * B(E4M3, K x N), accumulated in f16 as a chain of k32 steps in K order, each step two
+// F13 groups of 16 products (k 0..15, then 16..31). The residual seeds the accumulator (round_f16(residual *
+// scale) when scaled); a partition restarts the chain from zero every PARTITION K and adds the partial sums in
+// f16, in order. The epilogue publishes as gemm_fp8.comp does: SiLU, then E4M3 and/or f16.
+//
+// One invocation computes one output element; a workgroup covers 64 columns of 4 rows (grid: row groups in x,
+// which has room for a 4K field, column groups in y, batches in z), which keeps a row's A bytes in cache.
+// Weights are k32-tile-major ([batch][K/32][Nmatrix][32]), so the 32 weights of one step for one column are
+// two uvec4.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
-#include "common.glsl"
+#include "exact_mma.glsl"
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 64, local_size_y = 4) in;
 
 layout(constant_id = 0) const uint K = 32;
 layout(constant_id = 2) const uint FLAGS = 0;
+layout(constant_id = 3) const uint PARTITION = 0;
 
 const uint F_RESIDUAL = 1u;
 const uint F_SCALE_RESIDUAL = 2u;
@@ -31,8 +42,8 @@ layout(push_constant) uniform Push {
   uint batches;
 } pc;
 
-layout(std430, binding = 0) readonly buffer InputA { uint8_t inputE4[]; };
-layout(std430, binding = 1) readonly buffer InputB { uint8_t weightsE4[]; };
+layout(std430, binding = 0) readonly buffer InputA { uvec4 a4[]; };             // E4M3 [rows][inputStride], 16-byte rows
+layout(std430, binding = 1) readonly buffer InputB { uvec4 b4[]; };             // E4M3 [batch][K/32][Nmatrix][32]
 layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t outputF16[]; };
 layout(std430, binding = 3) readonly buffer ResidualHalf { float16_t residualF16[]; };
 layout(std430, binding = 4) readonly buffer Aux { float16_t auxF16[]; };
@@ -40,32 +51,34 @@ layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t outputE4[]; };
 layout(std430, binding = 6) readonly buffer ResidualE4 { uint8_t residualE4[]; };
 
 void main() {
-  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
-  uint count = pc.rows * pc.batches * pc.N;
-  if (id >= count) return;
-  uint column = id % pc.N;
-  uint batch = (id / pc.N) % pc.batches;
-  uint row = id / (pc.N * pc.batches);
-  uint inputBase = row * pc.inputStride + pc.inputColumnBase +
-                   (((FLAGS & F_BROADCAST_INPUT) != 0u) ? 0u : batch * K);
-  precise float16_t value = float16_t(0.0);
+  const uint column = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;
+  const uint batch = gl_WorkGroupID.z;
+  const uint row = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+  if (column >= pc.N || row >= pc.rows || batch >= pc.batches) return;
+  const uint outputIndex = row * pc.outputStride + pc.outputColumnOffset + batch * pc.N + column;
+
+  float16_t acc = float16_t(0.0);
   if ((FLAGS & F_RESIDUAL) != 0u) {
-    uint residualIndex = row * pc.outputStride + pc.outputColumnOffset + batch * pc.N + column;
-    value = (FLAGS & F_RESIDUAL_E4) != 0u
-                ? float16_t(e4m3ToF32(uint(residualE4[residualIndex])))
-                : residualF16[residualIndex];
-    if ((FLAGS & F_SCALE_RESIDUAL) != 0u) value = value * auxF16[pc.auxHalfOffset + column];
+    float residual = (FLAGS & F_RESIDUAL_E4) != 0u ? e4m3ToF32(uint(residualE4[outputIndex])) : float(residualF16[outputIndex]);
+    // two halves (or an E4M3 value and a half): the f32 product is exact, so this is the one rounding
+    if ((FLAGS & F_SCALE_RESIDUAL) != 0u) residual = roundF16(residual * float(auxF16[pc.auxHalfOffset + column]));
+    acc = float16_t(residual);
   }
-  for (uint k = 0u; k < K; ++k) {
-    uint weight = (((batch * (K / 32u) + k / 32u) * pc.Nmatrix +
-                    pc.weightColumnOffset + column) * 32u) + (k & 31u);
-    float16_t a = float16_t(e4m3ToF32(uint(inputE4[inputBase + k])));
-    float16_t b = float16_t(e4m3ToF32(uint(weightsE4[weight])));
-    value = fma(a, b, value);
+  const uint aBase = (row * pc.inputStride + pc.inputColumnBase + (((FLAGS & F_BROADCAST_INPUT) != 0u) ? 0u : batch * K)) / 16u;
+  const uint bColumn = pc.weightColumnOffset + column;
+  float16_t total = float16_t(0.0);
+  for (uint kb = 0u; kb < K; kb += 32u) {
+    const uint bBase = ((batch * (K / 32u) + kb / 32u) * pc.Nmatrix + bColumn) * 2u;
+    acc = adaFp8Fdpa16(a4[aBase + kb / 16u], b4[bBase], acc);
+    acc = adaFp8Fdpa16(a4[aBase + kb / 16u + 1u], b4[bBase + 1u], acc);
+    if (PARTITION != 0u && (((kb + 32u) % PARTITION) == 0u || kb + 32u >= K)) {
+      total = kb < PARTITION ? acc : addHalf(total, acc);
+      acc = float16_t(0.0);
+    }
   }
-  if ((FLAGS & F_SILU) != 0u) value = siluHalf(value);
-  uint outputIndex = row * pc.outputStride + pc.outputColumnOffset + batch * pc.N + column;
-  if ((FLAGS & F_QUANTIZE) == 0u) outputF16[outputIndex] = value;
-  if ((FLAGS & (F_QUANTIZE | F_DUAL)) != 0u)
-    outputE4[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+  if (PARTITION != 0u) acc = total;
+
+  if ((FLAGS & F_SILU) != 0u) acc = siluHalf(acc);
+  if ((FLAGS & F_QUANTIZE) == 0u) outputF16[outputIndex] = acc;
+  if ((FLAGS & (F_QUANTIZE | F_DUAL)) != 0u) outputE4[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(acc)));
 }

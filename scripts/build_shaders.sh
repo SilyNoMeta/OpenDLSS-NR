@@ -27,6 +27,8 @@ for source in "$root"/shaders/*.comp; do
   "$glslang" -V --target-env vulkan1.3 -I"$root/shaders" "$source" \
     -o "$shader_out/$(basename "${source%.comp}").spv"
 done
+# ops.comp once more without the hardware E4M3 conversions, for the compatibility backend
+"$glslang" -V --target-env vulkan1.3 -DDLSS_SOFTWARE_E4M3 -I"$root/shaders" "$root/shaders/ops.comp" \n  -o "$shader_out/ops_compat.spv"
 
 for k in 64 128 256; do
   "$python" "$root/scripts/ptx/mlp_e4m3.py" "$k" "$ptx_out/mlp_e4m3_K$k.ptx" 3 1 1 >/dev/null

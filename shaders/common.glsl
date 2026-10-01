@@ -89,6 +89,17 @@ float e4m3HwToF32(uint code) {
   float value = float(uintBitsToFloate4m3EXT(uint8_t(code & 0xffu)));
   return isnan(value) ? 0.0 : value;
 }
+#elif defined(DLSS_SOFTWARE_E4M3)
+// The same three conversions without VK_EXT_shader_float8 (the compatibility backend's ops_compat.spv): the
+// software spelling above gives the hardware's code for every half, NaN included (both publish it as +0).
+uint8_t e4m3Hw(float16_t value) { return uint8_t(e4m3CodeFromF16Bits(f16Bits(value))); }
+
+uint16_t e4m3HwPair(f16vec2 value) {
+  return uint16_t(e4m3CodeFromF16Bits(f16Bits(value.x)) | (e4m3CodeFromF16Bits(f16Bits(value.y)) << 8u));
+}
+
+float e4m3ToF32(uint bits);
+float e4m3HwToF32(uint code) { return e4m3ToF32(code & 0xffu); }
 #endif
 
 // The network's cubic SiLU in half FMAs: identical to the f32 formulation (mpCubicSilu below) for all

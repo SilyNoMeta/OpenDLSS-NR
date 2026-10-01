@@ -3,11 +3,17 @@
 // v2: one thread per eight consecutive channels of one pixel (16-byte f16 and
 // 8-byte E4M3 accesses, packed hardware conversions); every half rounding is
 // the bit-level roundF16 or a packed 16-bit conversion, never float(float16_t()).
+#ifndef DLSS_SOFTWARE_E4M3
 #extension GL_EXT_float_e4m3 : require
+#endif
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
+// Built twice: ops.spv with the hardware E4M3 conversions (the native backend), and ops_compat.spv with
+// -DDLSS_SOFTWARE_E4M3, their bit-identical software spelling (common.glsl), for GPUs without shaderFloat8.
+#ifndef DLSS_SOFTWARE_E4M3
 #define DLSS_E4M3_HW 1
+#endif
 #include "common.glsl"
 
 layout(local_size_x = 256) in;

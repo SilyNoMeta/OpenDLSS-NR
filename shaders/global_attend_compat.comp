@@ -1,18 +1,25 @@
 #version 460
-// Scalar global attention for GPUs without native FP8 matrix instructions.
+// Global ViT cosine attention for the compatibility backend: the same function as global_attend.comp, bit for
+// bit, with the two tensor-core products emulated (exact_mma.glsl):
+//   S = Q K^T             two F13 groups over the 32 components, from zero
+//   w = vitExpWeight(S), unnormalized E4M3 weights; the running total per 64-key block, minus the padding keys
+//   O = P V               F13 groups of sixteen keys over the padded token count, in key order, from zero
+//   out = E4M3(round_f16(O * f16(1 / total)))
+// One workgroup = one (head, 16-query tile), as in the native kernel.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
-#include "common.glsl"
+#include "exact_mma.glsl"
 
 layout(local_size_x = 32) in;
 layout(constant_id = 0) const uint PADDED_TOKENS = 192;
 
 layout(push_constant) uniform Push { uint tokens; uint heads; uint channels; } pc;
-layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };
+layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };   // E4M3 [paddedTokens][channels*3]
 layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; };
 
+shared uvec4 qs[16u * 2u];                       // [query][16-component part]
 shared float16_t scores[16u * PADDED_TOKENS];
-shared uint8_t weights[16u * PADDED_TOKENS];
+shared uvec4 weights[16u * (PADDED_TOKENS / 16u)];   // [query][16-key group]
 shared float16_t reciprocals[16];
 
 float16_t vitExpWeight(float16_t score) {
@@ -42,6 +49,16 @@ float16_t softmax64(uint row, uint base) {
   return even + odd;
 }
 
+uint packCodes(uint c0, uint c1, uint c2, uint c3) { return c0 | (c1 << 8u) | (c2 << 16u) | (c3 << 24u); }
+
+// Sixteen consecutive E4M3 bytes from `base` as one uvec4.
+uvec4 load16(uint base) {
+  uvec4 words;
+  for (uint w = 0u; w < 4u; ++w)
+    words[w] = packCodes(uint(qkv[base + w * 4u]), uint(qkv[base + w * 4u + 1u]), uint(qkv[base + w * 4u + 2u]), uint(qkv[base + w * 4u + 3u]));
+  return words;
+}
+
 void main() {
   uint lane = gl_LocalInvocationID.x;
   uint head = gl_WorkGroupID.x;
@@ -49,15 +66,15 @@ void main() {
   uint stride3 = pc.channels * 3u;
   uint headBase = head * 96u;
 
-  for (uint i = lane; i < 16u * PADDED_TOKENS; i += 32u) {
-    uint row = i / PADDED_TOKENS, key = i % PADDED_TOKENS;
-    precise float16_t value = float16_t(0.0);
-    for (uint c = 0u; c < 32u; ++c) {
-      float16_t q = float16_t(e4m3ToF32(uint(qkv[(qTile * 16u + row) * stride3 + headBase + c])));
-      float16_t k = float16_t(e4m3ToF32(uint(qkv[key * stride3 + headBase + 32u + c])));
-      value = fma(q, k, value);
+  qs[lane] = load16((qTile * 16u + (lane >> 1u)) * stride3 + headBase + (lane & 1u) * 16u);
+  barrier();
+  for (uint key = lane; key < PADDED_TOKENS; key += 32u) {
+    uvec4 k0 = load16(key * stride3 + headBase + 32u), k1 = load16(key * stride3 + headBase + 48u);
+    for (uint row = 0u; row < 16u; ++row) {
+      float16_t s = adaFp8Fdpa16(qs[row * 2u], k0, float16_t(0.0));
+      s = adaFp8Fdpa16(qs[row * 2u + 1u], k1, s);
+      scores[row * PADDED_TOKENS + key] = vitExpWeight(s);
     }
-    scores[i] = vitExpWeight(value);
   }
   barrier();
 
@@ -65,25 +82,36 @@ void main() {
     precise float16_t total = float16_t(0.0);
     for (uint base = 0u; base < PADDED_TOKENS; base += 64u) total = total + softmax64(lane, base);
     uint padding = PADDED_TOKENS - pc.tokens;
-    if (padding > 0u)
-      total = total - float16_t(float(vitExpWeight(float16_t(0.0))) * float(padding));
+    if (padding > 0u) {
+      precise float16_t correction = float16_t(float(vitExpWeight(float16_t(0.0))) * float(padding));
+      total = total - correction;
+    }
     reciprocals[lane] = float16_t(1.0 / float(total));
   }
-  for (uint i = lane; i < 16u * PADDED_TOKENS; i += 32u)
-    weights[i] = uint8_t(e4m3CodeFromF16Bits(f16Bits(scores[i])));
+  for (uint i = lane; i < 16u * (PADDED_TOKENS / 16u); i += 32u) {
+    uint row = i / (PADDED_TOKENS / 16u), group = i % (PADDED_TOKENS / 16u);
+    uint codes[16];
+    for (uint j = 0u; j < 16u; ++j) codes[j] = e4m3CodeFromF16Bits(f16Bits(scores[row * PADDED_TOKENS + group * 16u + j]));
+    weights[i] = uvec4(packCodes(codes[0], codes[1], codes[2], codes[3]), packCodes(codes[4], codes[5], codes[6], codes[7]),
+                       packCodes(codes[8], codes[9], codes[10], codes[11]), packCodes(codes[12], codes[13], codes[14], codes[15]));
+  }
   barrier();
 
-  for (uint i = lane; i < 16u * 32u; i += 32u) {
-    uint row = i >> 5u, component = i & 31u;
+  // Each lane owns one component; the sixteen-key groups of V for it are gathered once and reused by every row.
+  uint component = lane;
+  float16_t values[16];
+  for (uint row = 0u; row < 16u; ++row) values[row] = float16_t(0.0);
+  for (uint group = 0u; group < PADDED_TOKENS / 16u; ++group) {
+    uint codes[16];
+    for (uint j = 0u; j < 16u; ++j) codes[j] = uint(qkv[(group * 16u + j) * stride3 + headBase + 64u + component]);
+    uvec4 v = uvec4(packCodes(codes[0], codes[1], codes[2], codes[3]), packCodes(codes[4], codes[5], codes[6], codes[7]),
+                    packCodes(codes[8], codes[9], codes[10], codes[11]), packCodes(codes[12], codes[13], codes[14], codes[15]));
+    for (uint row = 0u; row < 16u; ++row) values[row] = adaFp8Fdpa16(weights[row * (PADDED_TOKENS / 16u) + group], v, values[row]);
+  }
+  for (uint row = 0u; row < 16u; ++row) {
     uint token = qTile * 16u + row;
     if (token >= pc.tokens) continue;
-    precise float16_t value = float16_t(0.0);
-    for (uint key = 0u; key < PADDED_TOKENS; ++key) {
-      float16_t weight = float16_t(e4m3ToF32(uint(weights[row * PADDED_TOKENS + key])));
-      float16_t v = float16_t(e4m3ToF32(uint(qkv[key * stride3 + headBase + 64u + component])));
-      value = fma(weight, v, value);
-    }
-    precise float outputValue = roundF16(float(value) * float(reciprocals[row]));
-    attended[token * pc.channels + head * 32u + component] = uint8_t(e4m3CodeFromF32(outputValue));
+    precise float value = roundF16(float(values[row]) * float(reciprocals[row]));
+    attended[token * pc.channels + head * 32u + component] = uint8_t(e4m3CodeFromF32(value));
   }
 }

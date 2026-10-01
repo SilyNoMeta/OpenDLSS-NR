@@ -1,8 +1,10 @@
 #version 460
-// Scalar f16 GEMM used by the compatibility backend.
+// f16 GEMM for the compatibility backend: the same function as gemm_f16.comp, bit for bit (the 16 -> 32 input
+// adapter and the 32 -> 4 head). A k16 step of the f16 tensor-core MMA is two F24 groups of eight products in K
+// order (exact_mma.glsl); the accumulator starts at zero. One invocation per output element.
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
-#include "common.glsl"
+#include "exact_mma.glsl"
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint K = 16;
@@ -14,7 +16,7 @@ const uint F_OUT_F32 = 256u;
 
 layout(push_constant) uniform Push { uint rows; uint N; uint inputStride; uint outputStride; } pc;
 layout(std430, binding = 0) readonly buffer InputA { float16_t a[]; };
-layout(std430, binding = 1) readonly buffer InputB { float16_t b[]; };
+layout(std430, binding = 1) readonly buffer InputB { float16_t b[]; };   // [K][PADDED_N]
 layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t out16[]; };
 layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t out8[]; };
 layout(std430, binding = 7) writeonly buffer OutputFloat { float out32[]; };
@@ -23,8 +25,17 @@ void main() {
   uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
   if (id >= pc.rows * pc.N) return;
   uint row = id / pc.N, column = id % pc.N;
-  precise float16_t value = float16_t(0.0);
-  for (uint k = 0u; k < K; ++k) value = fma(a[row * pc.inputStride + k], b[k * PADDED_N + column], value);
+  float16_t value = float16_t(0.0);
+  for (uint k = 0u; k < K; k += 8u) {
+    const uint ai = row * pc.inputStride + k;
+    f16vec4 a0 = f16vec4(a[ai], a[ai + 1u], a[ai + 2u], a[ai + 3u]);
+    f16vec4 a1 = f16vec4(a[ai + 4u], a[ai + 5u], a[ai + 6u], a[ai + 7u]);
+    f16vec4 b0 = f16vec4(b[k * PADDED_N + column], b[(k + 1u) * PADDED_N + column], b[(k + 2u) * PADDED_N + column],
+                         b[(k + 3u) * PADDED_N + column]);
+    f16vec4 b1 = f16vec4(b[(k + 4u) * PADDED_N + column], b[(k + 5u) * PADDED_N + column], b[(k + 6u) * PADDED_N + column],
+                         b[(k + 7u) * PADDED_N + column]);
+    value = adaF16Fdpa8(a0, a1, b0, b1, value);
+  }
   uint outputIndex = row * pc.outputStride + column;
   if ((FLAGS & F_OUT_F32) != 0u) out32[outputIndex] = float(value);
   else if ((FLAGS & F_QUANTIZE) != 0u) out8[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));

@@ -43,10 +43,12 @@ void check(bool condition, const char* message) {
 Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
   g_nativeFp8 = context.nativeFp8();
   ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + "/../ptx";
-  for (const char* name : {"ops", "window_normalize", "global_normalize", "preprocess"}) {
+  for (const char* name : {"window_normalize", "global_normalize", "preprocess"}) {
     modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + name + ".spv");
   }
-  for (const char* name : {"gemm_fp8", "gemm_f16", "window_attend", "global_attend"}) {
+  // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) have a compatibility twin with the
+  // same arithmetic in software; the native backend never loads those.
+  for (const char* name : {"ops", "gemm_fp8", "gemm_f16", "window_attend", "global_attend"}) {
     const std::string file = std::string(name) + (g_nativeFp8 ? "" : "_compat");
     modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + file + ".spv");
   }
@@ -248,6 +250,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     vk::SpecConstants constants;
     constants.add(0, a.K);
     constants.add(2, flags);
+    constants.add(3, a.partition);
     struct Push {
       uint32_t rows, N, Nmatrix, weightColumnOffset, inputStride, inputColumnBase, outputStride, outputColumnOffset,
           auxHalfOffset, batches;
@@ -263,9 +266,10 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     if (a.dualOutput) bindings[5] = &a.dualOutput->buffer;
     if (a.residual && a.residual->format == Format::E4) bindings[6] = &a.residual->buffer;
     dispatchLabel_ = "gemm_e4m3_compat " + std::to_string(a.rows) + "x" + std::to_string(a.K) + "->" +
-                     std::to_string(a.N);
-    dispatchLinear(commands, pipeline("gemm_fp8", constants, 0), bindings, &push, sizeof(push),
-                   a.rows * a.batches * a.N);
+                     std::to_string(a.N) + (a.partition ? " p" + std::to_string(a.partition) : "");
+    // gemm_fp8_compat.comp: 64 columns x 4 rows per workgroup; rows in x (room for a 4K field), batches in z
+    dispatch(commands, pipeline("gemm_fp8", constants, 0), bindings, &push, sizeof(push), (a.rows + 3) / 4,
+             (a.N + 63) / 64, a.batches);
     return;
   }
   // Split-K: independent partition chains in separate workgroups plus a reduce pass, for the
