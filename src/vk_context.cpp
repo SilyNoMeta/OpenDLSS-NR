@@ -595,11 +595,15 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
                   : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
   VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
+  result.allocation = requirements.size;
+  (hostVisible ? memoryUse_.hostVisible : memoryUse_.deviceLocal) += result.allocation;
+  memoryUse_.peakDeviceLocal = std::max(memoryUse_.peakDeviceLocal, memoryUse_.deviceLocal);
   if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
   return result;
 }
 
 void Context::destroyBuffer(Buffer& buffer) {
+  if (buffer.memory) (buffer.hostVisible ? memoryUse_.hostVisible : memoryUse_.deviceLocal) -= buffer.allocation;
   if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
   if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
   if (buffer.memory) vkFreeMemory(device_, buffer.memory, nullptr);

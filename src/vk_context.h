@@ -30,6 +30,7 @@ struct Buffer {
   bool hostVisible = false;
   void* mapped = nullptr;
   const char* label = "";
+  VkDeviceSize allocation = 0;   // bytes of the memory allocation behind it (what the accounting counts)
 };
 
 constexpr uint32_t kGenericBindings = 12;
@@ -194,6 +195,10 @@ class Context {
 
   uint32_t maxComputeSharedMemory() const { return maxSharedMemory_; }
 
+  // Memory accounting of every buffer this Context created (device-local and host-visible apart), current and peak.
+  struct MemoryUse { VkDeviceSize deviceLocal = 0, hostVisible = 0, peakDeviceLocal = 0; };
+  const MemoryUse& memoryUse() const { return memoryUse_; }
+
  private:
   uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required);
   VkInstance instance_ = VK_NULL_HANDLE;
@@ -218,6 +223,7 @@ class Context {
   uint32_t subgroupSize_ = 0;
   Backend backend_ = Backend::Native;
   bool executableProperties_ = false;   // VK_KHR_pipeline_executable_properties enabled (statistics)
+  MemoryUse memoryUse_;
   bool owned_ = true;
   std::string deviceName_;
   void readDeviceProperties();   // SMs, subgroup, limits, memory types

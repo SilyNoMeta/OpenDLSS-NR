@@ -56,6 +56,11 @@ class Model {
   const vk::Buffer& relativeBias(const Tensor& tensor, uint32_t relativeByteOffset, uint32_t heads);
 
   size_t nanWeightsReplaced() const { return nanWeights_; }
+  VkDeviceSize matrixBytes() const {   // the re-laid weight matrices built so far (lazily, by the graphs)
+    VkDeviceSize bytes = 0;
+    for (const auto& [key, buffer] : matrices_) bytes += buffer.allocation;
+    return bytes;
+  }
   uint32_t blockCount() const { return blockCount_; }
 
  private:

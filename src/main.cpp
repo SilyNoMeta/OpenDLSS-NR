@@ -592,11 +592,23 @@ int runBench(int argc, char** argv) {
   uint32_t height = (uint32_t)atoi(argValue(argc, argv, "--height", "768").c_str());
   int frames = atoi(argValue(argc, argv, "--frames", "10").c_str());
   if (modelDir.empty()) { fprintf(stderr, "usage: dlss5vk bench --model <dir> [--width W --height H --frames N]\n"); return 2; }
+  // Preparation (once) and the recurring frame are reported apart: device and model setup, kernels, the graph
+  // build, and the first frame, which pays for the pipeline and PTX compilation the later frames reuse.
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::time_point from) { return std::chrono::duration<double>(Clock::now() - from).count(); };
+  auto mib = [](VkDeviceSize bytes) { return bytes / 1048576.0; };
+  auto started = Clock::now();
   vk::Context context;
   printf("device: %s\n", context.deviceName().c_str());
+  const double contextSeconds = seconds(started);
+  started = Clock::now();
   nr::Model model(context, modelDir, false);
+  const double modelSeconds = seconds(started);
+  const VkDeviceSize modelBytes = context.memoryUse().deviceLocal;
+  started = Clock::now();
   nr::Kernels kernels(context, shaderDir);
   kernels.setSiluTable(ref::siluTable());
+  const double kernelSeconds = seconds(started);
   nr::Geometry geometry = nr::Geometry::fromValid(width, height);
   const uint32_t fullRows = geometry.fullWidth * geometry.fullHeight;
   std::vector<float> synthetic((size_t)fullRows * 16);
@@ -609,7 +621,10 @@ int runBench(int argc, char** argv) {
     features = graph->allocate("input features", fullRows, 16, nr::Format::F32);
     context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
   };
+  started = Clock::now();
   build();
+  const double graphSeconds = seconds(started);
+  started = Clock::now();
   // Warm compile. A chained wait that timed out here (a GPU that schedules the launches differently) rebuilds the
   // graph with barriers, as the demo does, instead of failing the run; later frames still fail on one.
   {
@@ -630,6 +645,14 @@ int runBench(int argc, char** argv) {
     }
     checkChainTimeouts(kernels);
   }
+  const double firstFrameSeconds = seconds(started);
+  printf("preparation: device %.2f s, model %.2f s, kernels %.2f s, graph %.2f s, first frame (compiles) %.2f s\n",
+         contextSeconds, modelSeconds, kernelSeconds, graphSeconds, firstFrameSeconds);
+  const vk::Context::MemoryUse& memory = context.memoryUse();
+  printf("memory: %.0f MiB device-local in use (raw tensors %.0f MiB, re-laid weights %.0f MiB, activations and scratch "
+         "%.0f MiB), peak %.0f MiB; host-visible %.0f MiB\n",
+         mib(memory.deviceLocal), mib(modelBytes), mib(model.matrixBytes()),
+         mib(memory.deviceLocal - modelBytes - model.matrixBytes()), mib(memory.peakDeviceLocal), mib(memory.hostVisible));
   VkQueryPool queries = context.createTimestampPool(2);
   std::vector<double> samples;
   for (int frame = 0; frame < frames; ++frame) {
