@@ -379,8 +379,8 @@ struct GraphRun {
 
 GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, const nr::Geometry& geometry,
                   const nr::Activation& features, bool chain, bool capture, int submissions) {
-  const bool chainBefore = nr::Kernels::chainEnabled();
-  nr::Kernels::setChainEnabled(chainBefore && chain);
+  const bool chainBefore = kernels.chainEnabled();
+  kernels.setChainEnabled(chainBefore && chain);
   GraphRun run;
   {
     nr::Graph::Options options;
@@ -412,7 +412,7 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
     for (const auto& [name, activation] : graph.boundaries())
       run.boundaries[name] = context.download(activation->buffer, activation->validBytes());
   }
-  nr::Kernels::setChainEnabled(chainBefore);
+  kernels.setChainEnabled(chainBefore);
   return run;
 }
 
@@ -632,10 +632,10 @@ int runBench(int argc, char** argv) {
     graph->record(commands, *features);
     context.endAndSubmit(commands, true);
     const nr::Kernels::ChainTimeouts timeouts = kernels.chainTimeouts();
-    if (timeouts.waits && nr::Kernels::chainEnabled()) {
+    if (timeouts.waits && kernels.chainEnabled()) {
       fprintf(stderr, "%u chained wait(s) timed out, the first on %s: rebuilding with barriers (DLSS5VK_CHAIN=0)\n",
               timeouts.waits, timeouts.counter.c_str());
-      nr::Kernels::setChainEnabled(false);
+      kernels.setChainEnabled(false);
       kernels.resetChainTimeouts();
       build();
       context.resetDescriptorPool();
@@ -655,14 +655,40 @@ int runBench(int argc, char** argv) {
          mib(memory.deviceLocal - modelBytes - model.matrixBytes()), mib(memory.peakDeviceLocal), mib(memory.hostVisible));
   VkQueryPool queries = context.createTimestampPool(2);
   std::vector<double> samples;
+  std::vector<double> wallSamples;
+  // --secondary: the demo's (and a host's) way, the graph recorded once into a secondary command buffer that every
+  // frame's primary executes; the descriptor sets stay in one pool for the secondary's lifetime.
+  const bool secondary = hasFlag(argc, argv, "--secondary");
+  VkCommandPool secondaryPool = VK_NULL_HANDLE;
+  VkCommandBuffer prerecorded = VK_NULL_HANDLE;
+  if (secondary) {
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.queueFamilyIndex = context.queueFamily();
+    VK_CHECK(vkCreateCommandPool(context.device(), &poolInfo, nullptr, &secondaryPool));
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = secondaryPool; allocate.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY; allocate.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(context.device(), &allocate, &prerecorded));
+    VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    begin.pInheritanceInfo = &inheritance;
+    context.resetDescriptorPool(0);
+    VK_CHECK(vkBeginCommandBuffer(prerecorded, &begin));
+    graph->record(prerecorded, *features);
+    VK_CHECK(vkEndCommandBuffer(prerecorded));
+    printf("recorded once into a secondary command buffer\n");
+  }
   for (int frame = 0; frame < frames; ++frame) {
-    context.resetDescriptorPool();
+    const auto frameStart = std::chrono::high_resolution_clock::now();
+    if (!secondary) context.resetDescriptorPool();
     VkCommandBuffer commands = context.beginCommands();
     vkCmdResetQueryPool(commands, queries, 0, 2);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
-    graph->record(commands, *features);
+    if (secondary) vkCmdExecuteCommands(commands, 1, &prerecorded);
+    else graph->record(commands, *features);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
     context.endAndSubmit(commands, true);
+    wallSamples.push_back(std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - frameStart).count());
     checkChainTimeouts(kernels);
     std::vector<double> stamps = context.readTimestampsMs(queries, 2);
     samples.push_back(stamps[1] - stamps[0]);
@@ -671,7 +697,10 @@ int runBench(int argc, char** argv) {
   std::sort(samples.begin(), samples.end());
   printf("median %.3f ms, min %.3f ms over %d frames at %ux%u (full %ux%u)\n", samples[samples.size() / 2],
          samples.front(), frames, width, height, geometry.fullWidth, geometry.fullHeight);
+  std::sort(wallSamples.begin(), wallSamples.end());
+  printf("host frame: median %.3f ms (recording + submission + GPU wait; readback excluded)\n", wallSamples[wallSamples.size() / 2]);
   vkDestroyQueryPool(context.device(), queries, nullptr);
+  if (secondaryPool) vkDestroyCommandPool(context.device(), secondaryPool, nullptr);
   return 0;
 }
 
@@ -827,11 +856,11 @@ int runProfile(int argc, char** argv) {
   uint32_t width = (uint32_t)atoi(argValue(argc, argv, "--width", "768").c_str());
   uint32_t height = (uint32_t)atoi(argValue(argc, argv, "--height", "768").c_str());
   if (modelDir.empty()) { fprintf(stderr, "usage: dlss5vk profile --model <dir> [--width W --height H]\n"); return 2; }
-  if (!getenv("DLSS5VK_CHAIN")) nr::Kernels::setChainEnabled(false);   // per-dispatch timings need the barriers
   vk::Context context;
   printf("maxComputeSharedMemorySize %u bytes\n", context.maxComputeSharedMemory());
   nr::Model model(context, modelDir, false);
   nr::Kernels kernels(context, shaderDir);
+  if (!getenv("DLSS5VK_CHAIN")) kernels.setChainEnabled(false);   // per-dispatch timings need the barriers
   kernels.setSiluTable(ref::siluTable());
   // Barrier/dispatch overhead: 400 trivial dispatches each followed by a full compute barrier.
   {

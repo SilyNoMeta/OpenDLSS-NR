@@ -57,6 +57,10 @@ def bench(binary: Path, model: Path, backend: str, width: int, height: int, fram
         row["dispatches"] = int(m[1])
     if m := re.search(r"backend: (\S+)", out):
         row["backend_reported"] = m[1]
+    if m := re.search(r"host frame: median ([\d.]+) ms", out):
+        row["host_frame_ms"] = float(m[1])
+    if row.get("backend_reported") != backend or "median_ms" not in row:
+        row["error"] = "Missing timing or requested backend not used:\n" + out[-2000:]
     return row
 
 
@@ -91,6 +95,7 @@ def main() -> None:
                       f"[{row['telemetry_after']}]", flush=True)
     if args.json:
         args.json.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    return 1 if any("error" in r for r in rows) else 0
 
 
 if __name__ == "__main__":

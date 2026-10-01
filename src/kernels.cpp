@@ -14,8 +14,6 @@ constexpr uint32_t F_RESIDUAL = 1, F_SCALE_RESIDUAL = 2, F_SILU = 8, F_QUANTIZE 
 // What the backend offers (vk::Context::backend): FP8 cooperative matrices and conversions in GLSL (native only), and
 // PTX launches (native: the generated kernels; sm86: the same kernels lowered by scripts/ptx/lower_sm86.py). The
 // compatibility GLSL twins stand in for whatever the backend lacks.
-bool g_nativeFp8 = true;
-bool g_ptx = true;
 
 // Workgroup shape for the GLSL FP8 GEMM: BM = 16 * subgroups rows, BN = 16 * tiles columns. Take the widest
 // column tile that still fills the GPU; below that, the shape that comes closest. Wider tiles beat more
@@ -45,23 +43,23 @@ void check(bool condition, const char* message) {
 }  // namespace
 
 Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
-  g_nativeFp8 = context.nativeFp8();
-  g_ptx = context.ptxKernels();
+  nativeFp8_ = context.nativeFp8();
+  ptx_ = context.ptxKernels();
   const bool sm86 = context.backend() == vk::Backend::Sm86;
   ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + (sm86 ? "/../ptx_sm86" : "/../ptx");
   // Counter chaining relies on the hardware scheduling the producer workgroups before their consumers spin; on the
   // sm86 route it stays off until asked for (DLSS5VK_CHAIN=1), the launches being separated by barriers.
-  if (sm86 && !getenv("DLSS5VK_CHAIN")) setChainEnabled(false);
+  chainEnabled_ = getenv("DLSS5VK_CHAIN") ? atoi(getenv("DLSS5VK_CHAIN")) != 0 : !sm86;
   modules_["preprocess"] = context_.loadShaderModule(shaderDirectory + "/preprocess.spv");
   // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) or an approximation the GLSL
   // compiler may relax (the norms) have a compatibility twin with the same arithmetic in exact software; the native
   // backend never loads those.
   for (const char* name : {"ops", "gemm_fp8", "gemm_f16", "window_attend", "global_attend", "window_normalize",
                            "global_normalize"}) {
-    const std::string file = std::string(name) + (g_nativeFp8 ? "" : "_compat");
+    const std::string file = std::string(name) + (nativeFp8_ ? "" : "_compat");
     modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + file + ".spv");
   }
-  if (g_nativeFp8) {
+  if (nativeFp8_) {
     for (const char* name : {"fused_block32", "qkv_attention", "gemm_mlp", "global_attention", "gemm_reduce"})
       modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + name + ".spv");
   }
@@ -136,9 +134,8 @@ void Kernels::dispatch(VkCommandBuffer commands, VkPipeline pipeline,
   ++dispatches_;
 }
 
-static bool g_chainEnabled = getenv("DLSS5VK_CHAIN") ? atoi(getenv("DLSS5VK_CHAIN")) != 0 : true;
-bool Kernels::chainEnabled() { return g_chainEnabled; }
-void Kernels::setChainEnabled(bool on) { g_chainEnabled = on; }
+bool Kernels::chainEnabled() const { return chainEnabled_; }
+void Kernels::setChainEnabled(bool on) { chainEnabled_ = on; }
 
 VkDeviceAddress Kernels::syncAddress(int block, SyncRegion region) {
   if (syncBuffer_.buffer == VK_NULL_HANDLE) { syncBuffer_ = context_.createBuffer((VkDeviceSize)kSyncSlots * kSyncSlotBytes, false, "sync counters"); context_.fillZero(syncBuffer_); }
@@ -211,7 +208,7 @@ void Kernels::cudaLaunchTracked(VkCommandBuffer commands, VkCudaFunctionNV funct
                                 uint32_t gridZ, uint32_t blockX, uint32_t sharedBytes, const void* const* params,
                                 size_t paramCount, bool chained) {
   context_.cudaLaunch(commands, function, gridX, gridY, gridZ, blockX, sharedBytes, params, paramCount);
-  if (!(chained && g_chainEnabled)) context_.computeBarrier(commands);
+  if (!(chained && chainEnabled_)) context_.computeBarrier(commands);
   if (profileQueries_ && profileCount_ < profileCapacity_) {
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profileQueries_, profileCount_++);
     profileLabels_.push_back(stageLabel_ + " | " + dispatchLabel_);
@@ -227,14 +224,14 @@ void Kernels::dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
   dispatch(commands, pipeline, bindings, push, pushBytes, std::min(groups, 65535u), y, 1);
 }
 
-bool Kernels::ptxGemmEnabled() {
+bool Kernels::ptxGemmEnabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_GEMM") ? atoi(getenv("DLSS5VK_PTX_GEMM")) != 0 : true;
-  return g_ptx && enabled;
+  return ptx_ && enabled;
 }
 
-bool Kernels::ptxQkvEnabled() {
+bool Kernels::ptxQkvEnabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_QKV") ? atoi(getenv("DLSS5VK_PTX_QKV")) != 0 : true;
-  return g_ptx && enabled;
+  return ptx_ && enabled;
 }
 
 // gemm_fp8_compat.comp: the exact software GEMM (partitions included), for GPUs without FP8 cooperative matrices.
@@ -287,7 +284,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   check(a.input->channels % 16 == 0 && a.inputColumnBase % 16 == 0, "GEMM input rows must be 16-byte aligned");
   check(!a.residual || a.residual->allocRows >= alignRows(a.rows), "GEMM residual rows");
   // The compatibility backend has no PTX: every GEMM is the exact software one.
-  if (!g_ptx) { gemmFp8Compat(commands, a); return; }
+  if (!ptx_) { gemmFp8Compat(commands, a); return; }
   // Split-K: independent partition chains in separate workgroups plus a reduce pass, for the
   // small-M partitioned GEMMs (ViT) whose workgroup count would otherwise starve the GPU.
   uint32_t splits = 1;
@@ -436,7 +433,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     throw std::runtime_error("chained GEMM has no PTX route (" + stageLabel_ + ": " + std::to_string(a.rows) + "x" + std::to_string(a.K) +
                              "->" + std::to_string(a.N) + " p" + std::to_string(a.partition) + ")");
   // No PTX route applies and the backend has no FP8 cooperative matrices (sm86): the exact software GEMM.
-  if (!g_nativeFp8) { gemmFp8Compat(commands, a); return; }
+  if (!nativeFp8_) { gemmFp8Compat(commands, a); return; }
   uint32_t subgroups = 4, tiles = 1;
   chooseGemmShape(a.N, a.rows, a.batches * splits, context_.smCount(), subgroups, tiles);
   uint32_t tile = tiles * 16, blockRows = subgroups * 16;
@@ -543,7 +540,7 @@ void Kernels::gemmF16(VkCommandBuffer commands, const GemmF16Args& a) {
   if (a.dualOutput) bindings[5] = &a.dualOutput->buffer;
   if (a.output->format == Format::F32) bindings[7] = &a.output->buffer;
   dispatchLabel_ = "gemm_f16 " + std::to_string(a.rows) + "x" + std::to_string(a.K) + "->" + std::to_string(a.N);
-  if (g_nativeFp8) {
+  if (nativeFp8_) {
     uint32_t rowGroups = (a.rows + 63) / 64;
     dispatch(commands, pipeline("gemm_f16", constants), bindings, &push, sizeof(push), 1, std::min(rowGroups, 65535u),
              (rowGroups + 65534) / 65535);
@@ -665,7 +662,7 @@ void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& proje
   dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
-bool Kernels::ptxGemmVEnabled() {
+bool Kernels::ptxGemmVEnabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_GEMMV") ? atoi(getenv("DLSS5VK_PTX_GEMMV")) != 0 : true;
   return enabled && ptxGemmEnabled();   // DLSS5VK_PTX_GEMM=0 turns off every PTX GEMM route
 }
@@ -683,9 +680,9 @@ uint32_t Kernels::vitGemmSignals(uint32_t rows, uint32_t N) {
   return (N / 128) * ((rows + bm - 1) / bm);
 }
 
-bool Kernels::ptxBlock32Enabled() {
+bool Kernels::ptxBlock32Enabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_BLOCK32") ? atoi(getenv("DLSS5VK_PTX_BLOCK32")) != 0 : true;
-  return g_ptx && enabled;
+  return ptx_ && enabled;
 }
 
 void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& a) {
@@ -723,7 +720,7 @@ void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& 
   cudaLaunchTracked(commands, kernel.function, groups, 1, 1, 128, 0, params, 29, a.chained);
 }
 
-bool Kernels::fusedBlock32IsPtx(const FusedBlock32Args& a) {
+bool Kernels::fusedBlock32IsPtx(const FusedBlock32Args& a) const {
   return ptxBlock32Enabled() && a.w1Ptx && a.w2Ptx && !a.skip16 && !a.outF16;
 }
 
@@ -851,9 +848,9 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
            std::min(rowGroups, 65535u), (rowGroups + 65534) / 65535);
 }
 
-bool Kernels::ptxFfnEnabled() {
+bool Kernels::ptxFfnEnabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_FFN") ? atoi(getenv("DLSS5VK_PTX_FFN")) != 0 : true;
-  return g_ptx && enabled;
+  return ptx_ && enabled;
 }
 
 uint32_t Kernels::ffnRowTiles(uint32_t channels) {
@@ -975,9 +972,9 @@ void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalize
            (windows + 65534) / 65535);
 }
 
-bool Kernels::ptxGlobalAttentionEnabled() {
+bool Kernels::ptxGlobalAttentionEnabled() const {
   static const bool enabled = getenv("DLSS5VK_PTX_ATTN") ? atoi(getenv("DLSS5VK_PTX_ATTN")) != 0 : true;
-  return g_ptx && enabled;
+  return ptx_ && enabled;
 }
 
 bool Kernels::globalAttentionPtx(uint32_t paddedTokens, const Activation* normalized) const {
@@ -989,7 +986,7 @@ bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
   static const int mode = getenv("DLSS5VK_ATTN_STREAM") ? atoi(getenv("DLSS5VK_ATTN_STREAM")) : -1;
   if (!ptxGlobalAttentionEnabled() || mode == 0) return false;
   if (mode < 0 && paddedTokens <= 256) return false;
-  static const bool available = std::ifstream(ptxDirectory_ + "/global_attention_stream_e4m3.ptx").good() &&
+  const bool available = std::ifstream(ptxDirectory_ + "/global_attention_stream_e4m3.ptx").good() &&
                                 std::ifstream(ptxDirectory_ + "/global_normalize_e4m3.ptx").good();
   return available;
 }

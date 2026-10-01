@@ -78,6 +78,8 @@ def main() -> None:
                 path = tmp / f"{key}.f32"
                 run_image(args.binary, args.model, request, proxy, backend, seed, path)
                 outputs[key] = np.fromfile(path, "<f4").reshape(h, w, 4)
+                if not np.isfinite(outputs[key]).all():
+                    raise SystemExit(f"{backend}: nonfinite output on {proxy}")
             source = np.fromfile(proxy, "<f4").reshape(h, w, 4)
             row = dict(request=request.get("label", directory.name), size=f"{w}x{h}",
                        nr_effect_mean_abs_255=float(np.abs(outputs["reference"][..., :3] - source[..., :3]).mean() * 255),

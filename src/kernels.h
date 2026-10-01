@@ -72,8 +72,8 @@ class Kernels {
   void gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args);
   void gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& args);   // the exact software GEMM
   void gemmF16(VkCommandBuffer commands, const GemmF16Args& args);
-  static bool ptxGemmEnabled();   // the gemm2 PTX route (DLSS5VK_PTX_GEMM, default on)
-  static bool ptxQkvEnabled();    // the fused QKV + window attention PTX route (DLSS5VK_PTX_QKV, default on)
+  bool ptxGemmEnabled() const;   // the gemm2 PTX route (DLSS5VK_PTX_GEMM, default on)
+  bool ptxQkvEnabled() const;    // the fused QKV + window attention PTX route (DLSS5VK_PTX_QKV, default on)
 
   struct PreprocessArgs {
     uint32_t fullWidth, fullHeight, validWidth, validHeight, sourceWidth, sourceHeight, seed;
@@ -129,11 +129,11 @@ class Kernels {
   };
   void fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& args);
   // PTX (VK_NV_cuda_kernel_launch) version of the fused 32-channel block (scripts/ptx/block32_e4m3.py).
-  static bool ptxBlock32Enabled();
+  bool ptxBlock32Enabled() const;
   // Whether these arguments take the PTX route (only PTX launches take part in counter chaining): the f16 skip and
   // raw-output variants of the block are GLSL only.
-  static bool fusedBlock32IsPtx(const FusedBlock32Args& args);
-  static bool ptxGemmVEnabled();   // the ViT GEMM PTX route (DLSS5VK_PTX_GEMMV, default on; implies ptxGemmEnabled)
+  bool fusedBlock32IsPtx(const FusedBlock32Args& args) const;
+  bool ptxGemmVEnabled() const;   // the ViT GEMM PTX route (DLSS5VK_PTX_GEMMV, default on; implies ptxGemmEnabled)
   static uint32_t vitGemmTileRows(uint32_t rows);   // 192 or 96
   static uint32_t vitGemmSignals(uint32_t rows, uint32_t N);   // chain signals of a gemmv launch: one per published tile
   void fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& args);
@@ -167,8 +167,8 @@ class Kernels {
   // stores, consumers spin on them (see swin.py sync_wait / sync_signal). Counter slots per block in syncBuffer_:
   // row bands of the FFN output (kSyncBands), window rows of the attention output (kSyncRows), row bands of the
   // projection output = the next block's state (kSyncState). A launch marked `chained` omits the compute barrier.
-  static bool chainEnabled();
-  static void setChainEnabled(bool on);
+  bool chainEnabled() const;
+  void setChainEnabled(bool on);
   enum SyncRegion { kSyncBands = 0, kSyncRows = 1, kSyncState = 2 };
   // Counters within a region are indexed by pixel-row band (row / 8) or by window row, so the region bounds the
   // field height a chain can cover.
@@ -210,7 +210,7 @@ class Kernels {
   };
   // Expert FFN + W3 in one PTX kernel (scripts/ptx/ffn_e4m3.py): w1 permuted tile-major [e][K/32][128][32],
   // w2 tile-major [e][4][32][32], w3 tile-major [K/32][K][32].
-  static bool ptxFfnEnabled();
+  bool ptxFfnEnabled() const;
   static uint32_t ffnRowTiles(uint32_t channels);          // PTX expert FFN: 16-row tiles per workgroup (its chaining signals cover 16 * tiles rows)
   void expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& args, const Chain& chain);
 
@@ -228,7 +228,7 @@ class Kernels {
   void globalAttention(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
                        Activation& attended, uint32_t tokens, uint32_t paddedTokens, uint32_t heads,
                        const Activation* normalized = nullptr, const Chain* chain = nullptr);   // normalized: E4 q/k/v from globalNormalize (large token counts)
-  static bool ptxGlobalAttentionEnabled();
+  bool ptxGlobalAttentionEnabled() const;
   bool globalAttentionPtx(uint32_t paddedTokens, const Activation* normalized) const;   // the PTX route applies
   // Streamed PTX route for any token count (global_attention_stream_e4m3.py): normalize once per (token, head)
   // into the per-head E4 layout, then attention with the key blocks streamed through shared memory.
@@ -275,6 +275,7 @@ class Kernels {
   void dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
                       const vk::Buffer* const bindings[vk::kGenericBindings], const void* push, uint32_t pushBytes,
                       uint32_t count);
+  bool nativeFp8_ = true, ptx_ = true, chainEnabled_ = true;
   vk::Context& context_;
   std::map<std::string, VkShaderModule> modules_;
   std::map<std::string, vk::Pipeline> pipelines_;

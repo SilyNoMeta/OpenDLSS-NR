@@ -152,13 +152,13 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
   // Chaining links consecutive PTX launches through device counters and drops the barrier between them, so every
   // launch in the chain must take its PTX route. Any switch that sends one kernel family (or one fused block)
   // back to GLSL takes the whole graph back to barriers.
-  routes_.chain = Kernels::chainEnabled() && options_.fusedBlocks && !options_.captureIntermediates &&
-                  Kernels::ptxGemmEnabled() && Kernels::ptxFfnEnabled() && Kernels::ptxQkvEnabled() &&
-                  Kernels::ptxBlock32Enabled() && routes_.fusePre && routes_.fusePool && routes_.fuseUpres &&
+  routes_.chain = kernels_.chainEnabled() && options_.fusedBlocks && !options_.captureIntermediates &&
+                  kernels_.ptxGemmEnabled() && kernels_.ptxFfnEnabled() && kernels_.ptxQkvEnabled() &&
+                  kernels_.ptxBlock32Enabled() && routes_.fusePre && routes_.fusePool && routes_.fuseUpres &&
                   routes_.fusePost;
   // The ViT launches are their own chain (a single completion counter per GEMM); they need only the ViT routes.
-  routes_.vitChain = routes_.vitChain && Kernels::chainEnabled() && options_.fusedBlocks &&
-                     !options_.captureIntermediates && Kernels::ptxGemmVEnabled();
+  routes_.vitChain = routes_.vitChain && kernels_.chainEnabled() && options_.fusedBlocks &&
+                     !options_.captureIntermediates && kernels_.ptxGemmVEnabled();
   // A chain's counters are indexed by pixel-row band or window row of the tallest stage, which is the field
   // itself (blocks 0 and 70). Past the region's capacity the indices would run into the next region.
   const uint32_t tallestRow = (geometry_.fullHeight + 4 + 7) / 8;   // + the largest window shift
@@ -239,7 +239,7 @@ Graph::Temporaries Graph::createTemporaries(const std::string& label, uint32_t r
   if (!fused) t.ffnResidual = allocate(label + " FFN residual", rows, channels, Format::F16);
   t.ffnQuantized = allocate(label + " FFN quantized", rows, channels, Format::E4);
   // c256 (one workgroup per SM) is faster with the separate projection GEMM, hence the default width limit.
-  if (fused && layout.expertFfn && Kernels::ptxFfnEnabled() && channels <= routes_.deferMax)
+  if (fused && layout.expertFfn && kernels_.ptxFfnEnabled() && channels <= routes_.deferMax)
     t.ffnQuantized2 = allocate(label + " FFN quantized B", rows, channels, Format::E4);
   if (!fused) t.qkv = allocate(label + " QKV", rows, channels * 3, Format::F16);
   if (!fused) t.normalized = allocate(label + " normalized QKV", rows, channels * 3, Format::E4);
@@ -260,7 +260,7 @@ Graph::SplitTemporaries Graph::createSplitTemporaries(const std::string& label, 
 }
 
 void Graph::chainBlock32(Kernels::FusedBlock32Args& f, int block, uint32_t waitScale, bool chainOut) {
-  const bool chain = routes_.chain && (routes_.chainMask & 2) && Kernels::fusedBlock32IsPtx(f);
+  const bool chain = routes_.chain && (routes_.chainMask & 2) && kernels_.fusedBlock32IsPtx(f);
   if (!chain) { c32Prev_.valid = false; return; }
   if (c32Prev_.valid) {
     f.chainWait = c32Prev_.rows; f.chainWaitExpected = c32Prev_.expected; f.chainWaitShiftY = c32Prev_.shiftY; f.chainWaitScale = waitScale;
@@ -295,7 +295,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
     f.skip16 = ffnSkipOverride;
     f.w1 = &model_.fp8Matrix(tensor, layout.expand, 32, layout.hidden);
     f.w2 = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, 0, false);   // [32 n][128 k]
-    if (Kernels::ptxBlock32Enabled()) {
+    if (kernels_.ptxBlock32Enabled()) {
       static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
       f.w1Ptx = &model_.fp8MatrixPermuted(tensor, layout.expand, 32, layout.hidden, 32, hiddenPerm, "mlp");
       f.w2Ptx = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, layout.hidden);   // tile-major [4][32][32]
@@ -325,7 +325,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
     const uint32_t w2Base = layout.expand + experts * channels * 128;
     const uint32_t w3Base = w2Base + experts * 128 * 32;
     const vk::Buffer& w1Weights = model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
-    if (options_.fusedBlocks && !options_.captureIntermediates && Kernels::ptxFfnEnabled() && channels <= 256) {
+    if (options_.fusedBlocks && !options_.captureIntermediates && kernels_.ptxFfnEnabled() && channels <= 256) {
       // PTX expert FFN + W3 in one kernel (ffn_e4m3.py): every expert of a row group in one workgroup.
       if (ffnSkipOverride) throw std::runtime_error("PTX expert FFN assumes the block state is the FFN skip");
       static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
@@ -532,7 +532,7 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
         model_.fp8Matrix(branchTensor, w2Base, branches * branchChannels, middleChannels, true, branchChannels);
     const vk::Buffer& w3Weights =
         model_.fp8Matrix(branchTensor, w3Base, branches * middleChannels, branchChannels, true, middleChannels);
-    if (options_.fusedBlocks && !options_.captureIntermediates && Kernels::ptxGemmEnabled()) {
+    if (options_.fusedBlocks && !options_.captureIntermediates && kernels_.ptxGemmEnabled()) {
       // No batched PTX GEMM: one single-batch GEMM per branch (its weights a tile-major block of K x N bytes), so the
       // branches reach the tensor cores on the sm86 backend. The same products, sums and publications.
       for (uint32_t b = 0; b < branches; ++b) {
@@ -734,7 +734,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     f.features = &inputFeatures; f.adapterWeights = &adapterWeights;
     f.w1 = &model_.fp8Matrix(preTensor, preLayout.expand, 32, preLayout.hidden);
     f.w2 = &model_.fp8Matrix(preTensor, preLayout.contractWeights, preLayout.hidden, 32, true, 0, false);
-    if (Kernels::ptxBlock32Enabled()) {
+    if (kernels_.ptxBlock32Enabled()) {
       static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
       f.w1Ptx = &model_.fp8MatrixPermuted(preTensor, preLayout.expand, 32, preLayout.hidden, 32, hiddenPerm, "mlp");
       f.w2Ptx = &model_.fp8Matrix(preTensor, preLayout.contractWeights, preLayout.hidden, 32, true, preLayout.hidden);   // tile-major [4][32][32]
@@ -950,7 +950,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
         f.inputScaleByteOffset = layout.transitionScale;
         f.w1 = &model_.fp8Matrix(tensor, layout.expand, 32, layout.hidden);
         f.w2 = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, 0, false);
-        if (Kernels::ptxBlock32Enabled()) {
+        if (kernels_.ptxBlock32Enabled()) {
           static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
           f.w1Ptx = &model_.fp8MatrixPermuted(tensor, layout.expand, 32, layout.hidden, 32, hiddenPerm, "mlp");
           f.w2Ptx = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, layout.hidden);   // tile-major [4][32][32]
@@ -1000,7 +1000,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       f.inputScaleByteOffset = layout.inputScale; f.adapterScaleByteOffset = layout.adapterScale;
       f.w1 = &model_.fp8Matrix(tensor, layout.expand, 32, layout.hidden);
       f.w2 = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, 0, false);
-      if (Kernels::ptxBlock32Enabled()) {
+      if (kernels_.ptxBlock32Enabled()) {
         static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
         f.w1Ptx = &model_.fp8MatrixPermuted(tensor, layout.expand, 32, layout.hidden, 32, hiddenPerm, "mlp");
         f.w2Ptx = &model_.fp8Matrix(tensor, layout.contractWeights, layout.hidden, 32, true, layout.hidden);   // tile-major [4][32][32]
