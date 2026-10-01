@@ -78,4 +78,9 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
 
 - [x] provenance, backends, build/data commands, results, limitations and hardware documented
 - [x] integration contract documents enabled queues/features, synchronization, resources, history and failure status
-- [~] audited pushes to `origin/feat/sm86` (no force-push, no private data, no binaries)
+- [x] audited push of the standalone qualification to `origin/feat/sm86`: `d017ab1`, remote HEAD verified
+      (10 linear commits, 53 changed commit blobs, 30 paths reviewed; no force-push, private data or new binaries)
+
+The standalone sm86 delivery is implemented and qualified to the scope in RESULTS.md. The optimized backend
+remains experimental because its full-network output differs from the exact route. Native hardware non-regression,
+Linux execution and perceptual acceptance require additional evidence; no Transfusion integration has started.
