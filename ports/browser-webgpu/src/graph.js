@@ -150,6 +150,10 @@ export class Graph {
 
   capture(name, source) {
     if (!this.options.captureBoundaries) return;
+    // Intra-block tensors ("block-N/qkv") only for the one block options.captureBlock names: a diagnostic, to
+    // compare one block's steps against another implementation.
+    const slash = name.indexOf('/');
+    if (slash >= 0 && name.slice(0, slash) !== `block-${this.options.captureBlock}`) return;
     const copy = this.tensors.allocate(`boundary ${name}`, source.rows, source.channels, source.format);
     this.recorder.copy(source.buffer, copy.buffer, copy.byteLength, `capture ${name}`);
     this.boundaries.set(name, copy);
@@ -204,16 +208,22 @@ export class Graph {
       });
     }
 
+    const prefix = `block-${block}/`;
+    this.capture(`${prefix}ffn`, temps.ffn);
+    this.capture(`${prefix}ffnResidual`, temps.ffnResidual);
+    this.capture(`${prefix}ffnQuantized`, temps.ffnQuantized);
     this.gemm({
       input: temps.ffnQuantized, weights: model.fp8Matrix(tensor, layout.qkv, channels, channels * 3),
       outputF16: temps.qkv, rows, k: channels, n: channels * 3, label: `${label} qkv`,
     });
+    this.capture(`${prefix}qkv`, temps.qkv);
     this.windowAttention({
       qkv: temps.qkv, attended: temps.attended,
       prior: model.relativeBias(tensor, layout.relative, layout.heads),
       scales: model.headScales(tensor, layout.scale, layout.heads),
       width, height, heads: layout.heads, phase, label,
     });
+    this.capture(`${prefix}attended`, temps.attended);
 
     // The attention skip: the E4M3 publication of the FFN for the expert blocks, the raw half for the others.
     this.gemm({

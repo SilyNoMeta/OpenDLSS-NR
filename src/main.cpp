@@ -385,6 +385,9 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
   {
     nr::Graph::Options options;
     options.captureBoundaries = capture;
+    // DLSS5VK_CAPTURE_BLOCK=N: the instrumented run also captures block N's intermediates (parity --dump writes them).
+    // It takes the unfused route, like dlss5vk verify, so only the compatibility backend keeps its schedule.
+    options.captureIntermediates = capture && getenv("DLSS5VK_CAPTURE_BLOCK") != nullptr;
     options.fusedBlocks = fusedBlocksEnabled();
     nr::Graph graph(context, model, kernels, geometry, options);
     run.chained = graph.chained();
@@ -566,8 +569,15 @@ int runParity(int argc, char** argv) {
     sum += head[i]; sumSquares += (double)head[i] * head[i];
   }
   printf("head: %zu values, mean %.6f, rms %.6f, non-finite %zu\n", headValues, sum / headValues, std::sqrt(sumSquares / headValues), nonFinite);
-  if (!dumpDir.empty())
+  if (!dumpDir.empty()) {
     std::ofstream(dumpDir + "/head.f32", std::ios::binary).write(reinterpret_cast<const char*>(production.head.data()), production.head.size());
+    for (const auto& [name, bytes] : instrumented.boundaries) {
+      if (name.find('/') == std::string::npos) continue;   // DLSS5VK_CAPTURE_BLOCK intermediates, as block-N_step.bin
+      std::string file = name;
+      std::replace(file.begin(), file.end(), '/', '_');
+      std::ofstream(dumpDir + "/" + file + ".bin", std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+  }
   if (proxyBuffer.buffer) context.destroyBuffer(proxyBuffer);
   context.destroyBuffer(features.buffer);
 

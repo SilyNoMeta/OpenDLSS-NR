@@ -213,6 +213,11 @@ const std::vector<std::string>& Graph::referenceBoundaryNames() {
 
 void Graph::capture(VkCommandBuffer commands, const std::string& name, const Activation& source) {
   if (!options_.captureBoundaries) return;
+  // Intra-block tensors ("block-N/qkv"): every block, or only the one DLSS5VK_CAPTURE_BLOCK names (a diagnostic,
+  // to compare one block's steps against another implementation without copying them all).
+  static const char* onlyBlock = getenv("DLSS5VK_CAPTURE_BLOCK");
+  const size_t slash = name.find('/');
+  if (slash != std::string::npos && onlyBlock && name.substr(0, slash) != std::string("block-") + onlyBlock) return;
   Activation* copy = allocate("boundary " + name, source.rows, source.channels, source.format);
   VkBufferCopy region{0, 0, source.validBytes()};
   context_.transferBarrier(commands);

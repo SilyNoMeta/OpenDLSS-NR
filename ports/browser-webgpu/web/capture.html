@@ -47,6 +47,7 @@ try {
   if (proxy.length !== width * height * 4) throw new Error(`proxy holds ${proxy.length} floats, ${width}x${height} needs ${width * height * 4}`);
   const network = await Network.create({
     weights: query.get('weights') ?? '/weights', width, height, captureBoundaries: true,
+    captureBlock: query.has('block') ? Number(query.get('block')) : null,
     onProgress: (text) => say(text),
   });
   const g = network.geometry;
@@ -84,6 +85,9 @@ try {
     if (name.startsWith('block-')) blocks.push({ block: Number(name.slice(6)), ...entry });
     else transitions.push({ id: name.slice('transition-'.length), ...entry });
   }
+  // ?block=N: that block's intermediates too (a diagnostic; not part of any fixture)
+  for (const name of network.boundaryNames.filter((n) => n.includes('/')))
+    await upload(`intermediates/${name.replace('/', '_')}.bin`, await network.readBoundary(name));
   await upload('features.f32', features);
   await upload('head.f32', head);
   await upload('proxy.f32', proxy);

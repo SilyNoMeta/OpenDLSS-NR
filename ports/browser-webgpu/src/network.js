@@ -27,7 +27,7 @@ export class Network {
    *   width,height - the valid image size; the padded field follows from it
    *   captureBoundaries - keep a copy of every block output, which the parity harness compares
    */
-  static async create({ weights, width, height, captureBoundaries = false, onProgress,
+  static async create({ weights, width, height, captureBoundaries = false, captureBlock = null, onProgress,
                         extraShaders = [], before, after, shaderBase = null,
                         device: existingDevice = null, model: existingModel = null } = {}) {
     const network = new Network();
@@ -83,7 +83,7 @@ export class Network {
     network.graph = new Graph({
       device, kernels, matmul: network.matmul, window: network.window,
       tensors: network.tensors, model: network.model, geometry,
-    }, { captureBoundaries });
+    }, { captureBoundaries, captureBlock });
     network.recorder = new Recorder(device, kernels, network.tensors);
     before?.(network);
     network.graph.record(network.recorder, network.features);
