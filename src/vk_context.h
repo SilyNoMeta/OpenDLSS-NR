@@ -59,9 +59,11 @@ struct Pipeline {
 // which and why; an explicit name is that route or an error.
 enum class Backend {
   Native,   // E4M3 cooperative matrices + FP8 PTX, fused blocks, counter chaining (Ada, Hopper, Blackwell)
-  Compat,   // software E4M3 in scalar GLSL: any NVIDIA Vulkan 1.3 GPU, no tensor cores, no fusion, no chaining
+  Compat,   // software E4M3 in scalar GLSL: any NVIDIA Vulkan 1.3 GPU, no tensor cores, no fusion, no chaining; exact
+  Sm86,     // the native PTX kernels lowered to f16 tensor cores (Ampere, compute capability 8.x) through
+            // VK_NV_cuda_kernel_launch, the compatibility GLSL elsewhere; close to native, not bit-exact
 };
-const char* backendName(Backend backend);          // "native", "compat"
+const char* backendName(Backend backend);          // "native", "compat", "sm86"
 const char* backendDescription(Backend backend);   // one line for logs
 std::optional<Backend> requestedBackend();          // DLSS5VK_BACKEND, empty for auto; throws on an unknown name
 
@@ -79,6 +81,7 @@ struct DeviceRequirements {
   VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
   VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
   VkPhysicalDeviceShaderSMBuiltinsFeaturesNV sm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV};
+  VkPhysicalDeviceCudaKernelLaunchFeaturesNV cuda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV};
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
   std::vector<const char*> extensions;
   explicit DeviceRequirements(Backend backend, bool enable = true);
@@ -139,7 +142,8 @@ class Context {
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const { return deviceName_; }
   Backend backend() const { return backend_; }
-  bool nativeFp8() const { return backend_ == Backend::Native; }
+  bool nativeFp8() const { return backend_ == Backend::Native; }   // FP8 cooperative matrices and conversions in GLSL
+  bool ptxKernels() const { return backend_ == Backend::Native || backend_ == Backend::Sm86; }
   uint32_t subgroupSize() const { return subgroupSize_; }
 
   // Buffers -----------------------------------------------------------------

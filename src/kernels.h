@@ -31,6 +31,7 @@ struct GemmFp8Args {
   const Activation* input = nullptr;
   uint32_t inputColumnBase = 0;   // added for every batch
   const vk::Buffer* weights = nullptr;  // plain [batches*K][Nmatrix] E4M3
+  uint32_t weightByteOffset = 0;  // where the matrix starts in `weights` (the PTX GEMM route only; 16-byte aligned)
   uint32_t Nmatrix = 0;
   uint32_t weightColumnOffset = 0;
   Activation* output = nullptr;   // F16 unless quantize (E4)
@@ -69,6 +70,7 @@ class Kernels {
   ~Kernels();
 
   void gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args);
+  void gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& args);   // the exact software GEMM
   void gemmF16(VkCommandBuffer commands, const GemmF16Args& args);
   static bool ptxGemmEnabled();   // the gemm2 PTX route (DLSS5VK_PTX_GEMM, default on)
   static bool ptxQkvEnabled();    // the fused QKV + window attention PTX route (DLSS5VK_PTX_QKV, default on)

@@ -11,7 +11,11 @@ namespace nr {
 namespace {
 constexpr uint32_t F_RESIDUAL = 1, F_SCALE_RESIDUAL = 2, F_SILU = 8, F_QUANTIZE = 16,
                    F_DUAL = 32, F_RESIDUAL_E4 = 64, F_BROADCAST_INPUT = 128, F_OUT_F32 = 256;
+// What the backend offers (vk::Context::backend): FP8 cooperative matrices and conversions in GLSL (native only), and
+// PTX launches (native: the generated kernels; sm86: the same kernels lowered by scripts/ptx/lower_sm86.py). The
+// compatibility GLSL twins stand in for whatever the backend lacks.
 bool g_nativeFp8 = true;
+bool g_ptx = true;
 
 // Workgroup shape for the GLSL FP8 GEMM: BM = 16 * subgroups rows, BN = 16 * tiles columns. Take the widest
 // column tile that still fills the GPU; below that, the shape that comes closest. Wider tiles beat more
@@ -42,7 +46,12 @@ void check(bool condition, const char* message) {
 
 Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
   g_nativeFp8 = context.nativeFp8();
-  ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + "/../ptx";
+  g_ptx = context.ptxKernels();
+  const bool sm86 = context.backend() == vk::Backend::Sm86;
+  ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + (sm86 ? "/../ptx_sm86" : "/../ptx");
+  // Counter chaining relies on the hardware scheduling the producer workgroups before their consumers spin; on the
+  // sm86 route it stays off until asked for (DLSS5VK_CHAIN=1), the launches being separated by barriers.
+  if (sm86 && !getenv("DLSS5VK_CHAIN")) setChainEnabled(false);
   modules_["preprocess"] = context_.loadShaderModule(shaderDirectory + "/preprocess.spv");
   // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) or an approximation the GLSL
   // compiler may relax (the norms) have a compatibility twin with the same arithmetic in exact software; the native
@@ -78,6 +87,9 @@ void Kernels::setSiluTable(const std::vector<uint16_t>& table) {
 }
 
 VkPipeline Kernels::pipeline(const char* shader, const vk::SpecConstants& constants, uint32_t requiredSubgroupSize) {
+  if (!modules_.count(shader))
+    throw std::runtime_error(std::string("the GLSL kernel ") + shader + " needs FP8 cooperative matrices, which the " +
+                             vk::backendName(context_.backend()) + " backend does not have (a PTX route switched off?)");
   std::string key = shader;
   for (uint32_t value : constants.data) key += ":" + std::to_string(value);
   auto it = pipelines_.find(key);
@@ -217,12 +229,46 @@ void Kernels::dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
 
 bool Kernels::ptxGemmEnabled() {
   static const bool enabled = getenv("DLSS5VK_PTX_GEMM") ? atoi(getenv("DLSS5VK_PTX_GEMM")) != 0 : true;
-  return g_nativeFp8 && enabled;
+  return g_ptx && enabled;
 }
 
 bool Kernels::ptxQkvEnabled() {
   static const bool enabled = getenv("DLSS5VK_PTX_QKV") ? atoi(getenv("DLSS5VK_PTX_QKV")) != 0 : true;
-  return g_nativeFp8 && enabled;
+  return g_ptx && enabled;
+}
+
+// gemm_fp8_compat.comp: the exact software GEMM (partitions included), for GPUs without FP8 cooperative matrices.
+void Kernels::gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& a) {
+  check(a.weightByteOffset == 0, "the compatibility GEMM takes no weight offset");
+  uint32_t flags = (a.residual ? F_RESIDUAL : 0) | (a.scaleResidual ? F_SCALE_RESIDUAL : 0) |
+                   (a.silu ? F_SILU : 0) | (a.quantize ? F_QUANTIZE : 0) |
+                   (a.dualOutput ? F_DUAL : 0) |
+                   (a.residual && a.residual->format == Format::E4 ? F_RESIDUAL_E4 : 0) |
+                   (a.broadcastInput ? F_BROADCAST_INPUT : 0);
+  check(!a.scaleResidual || a.auxTensor, "scaled residual needs an aux tensor");
+  vk::SpecConstants constants;
+  constants.add(0, a.K);
+  constants.add(2, flags);
+  constants.add(3, a.partition);
+  struct Push {
+    uint32_t rows, N, Nmatrix, weightColumnOffset, inputStride, inputColumnBase, outputStride, outputColumnOffset,
+        auxHalfOffset, batches;
+  } push{a.rows, a.N, a.Nmatrix, a.weightColumnOffset, a.input->channels, a.inputColumnBase, a.output->channels,
+         a.outputColumnOffset, a.auxByteOffset / 2, a.batches};
+  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  bindings[0] = &a.input->buffer;
+  bindings[1] = a.weights;
+  if (!a.quantize) bindings[2] = &a.output->buffer;
+  if (a.residual && a.residual->format == Format::F16) bindings[3] = &a.residual->buffer;
+  if (a.auxTensor) bindings[4] = &a.auxTensor->raw;
+  if (a.quantize) bindings[5] = &a.output->buffer;
+  if (a.dualOutput) bindings[5] = &a.dualOutput->buffer;
+  if (a.residual && a.residual->format == Format::E4) bindings[6] = &a.residual->buffer;
+  dispatchLabel_ = "gemm_e4m3_compat " + std::to_string(a.rows) + "x" + std::to_string(a.K) + "->" +
+                   std::to_string(a.N) + (a.partition ? " p" + std::to_string(a.partition) : "");
+  // gemm_fp8_compat.comp: 64 columns x 4 rows per workgroup; rows in x (room for a 4K field), batches in z
+  dispatch(commands, pipeline("gemm_fp8", constants, 0), bindings, &push, sizeof(push), (a.rows + 3) / 4,
+           (a.N + 63) / 64, a.batches);
 }
 
 void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
@@ -240,38 +286,8 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   check(a.partition == 0 || (a.partition % 32 == 0 && a.K % a.partition == 0), "GEMM partition");
   check(a.input->channels % 16 == 0 && a.inputColumnBase % 16 == 0, "GEMM input rows must be 16-byte aligned");
   check(!a.residual || a.residual->allocRows >= alignRows(a.rows), "GEMM residual rows");
-  if (!g_nativeFp8) {
-    uint32_t flags = (a.residual ? F_RESIDUAL : 0) | (a.scaleResidual ? F_SCALE_RESIDUAL : 0) |
-                     (a.silu ? F_SILU : 0) | (a.quantize ? F_QUANTIZE : 0) |
-                     (a.dualOutput ? F_DUAL : 0) |
-                     (a.residual && a.residual->format == Format::E4 ? F_RESIDUAL_E4 : 0) |
-                     (a.broadcastInput ? F_BROADCAST_INPUT : 0);
-    check(!a.scaleResidual || a.auxTensor, "scaled residual needs an aux tensor");
-    vk::SpecConstants constants;
-    constants.add(0, a.K);
-    constants.add(2, flags);
-    constants.add(3, a.partition);
-    struct Push {
-      uint32_t rows, N, Nmatrix, weightColumnOffset, inputStride, inputColumnBase, outputStride, outputColumnOffset,
-          auxHalfOffset, batches;
-    } push{a.rows, a.N, a.Nmatrix, a.weightColumnOffset, a.input->channels, a.inputColumnBase, a.output->channels,
-           a.outputColumnOffset, a.auxByteOffset / 2, a.batches};
-    const vk::Buffer* bindings[vk::kGenericBindings] = {};
-    bindings[0] = &a.input->buffer;
-    bindings[1] = a.weights;
-    if (!a.quantize) bindings[2] = &a.output->buffer;
-    if (a.residual && a.residual->format == Format::F16) bindings[3] = &a.residual->buffer;
-    if (a.auxTensor) bindings[4] = &a.auxTensor->raw;
-    if (a.quantize) bindings[5] = &a.output->buffer;
-    if (a.dualOutput) bindings[5] = &a.dualOutput->buffer;
-    if (a.residual && a.residual->format == Format::E4) bindings[6] = &a.residual->buffer;
-    dispatchLabel_ = "gemm_e4m3_compat " + std::to_string(a.rows) + "x" + std::to_string(a.K) + "->" +
-                     std::to_string(a.N) + (a.partition ? " p" + std::to_string(a.partition) : "");
-    // gemm_fp8_compat.comp: 64 columns x 4 rows per workgroup; rows in x (room for a 4K field), batches in z
-    dispatch(commands, pipeline("gemm_fp8", constants, 0), bindings, &push, sizeof(push), (a.rows + 3) / 4,
-             (a.N + 63) / 64, a.batches);
-    return;
-  }
+  // The compatibility backend has no PTX: every GEMM is the exact software one.
+  if (!g_ptx) { gemmFp8Compat(commands, a); return; }
   // Split-K: independent partition chains in separate workgroups plus a reduce pass, for the
   // small-M partitioned GEMMs (ViT) whose workgroup count would otherwise starve the GPU.
   uint32_t splits = 1;
@@ -286,7 +302,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   // ViT PTX GEMM (gemmv_e4m3.py: 192 x 128 tiles of eight 48 x 64 warps, one chain per workgroup = the whole K or
   // one partition per split-K workgroup, the reduce folded into the last-arriving workgroup, counter chaining).
   const bool ptxGemmV = ptxGemmVEnabled();
-  if (ptxGemmV && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 128 == 0 &&
+  if (ptxGemmV && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 128 == 0 && a.weightByteOffset == 0 &&
       (!a.residual || (a.scaleResidual && a.residual->format == Format::E4)) && a.K / 32 >= 3 &&
       (a.chainSingle || (!a.chainWaitRows && !a.chainWaitBands && !a.chainSignal))) {   // gemmv chains on one counter
     const uint32_t bm = vitGemmTileRows(a.rows), warps = bm / 24;
@@ -333,7 +349,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   // Tall-tile PTX GEMM (gemmt_e4m3.py, 192-row tiles, partitions in the workgroup or one partition per split-K
   // workgroup + a PTX reduce): the few-row stages (ViT / transitions), when the variant was generated.
   static const bool ptxGemmT = getenv("DLSS5VK_PTX_GEMMT") ? atoi(getenv("DLSS5VK_PTX_GEMMT")) != 0 : true;
-  if (ptxGemmT && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 64 == 0 &&
+  if (ptxGemmT && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 64 == 0 && a.weightByteOffset == 0 &&
       (!a.residual || (a.scaleResidual && a.residual->format == Format::E4)) && a.partition != 0 &&   // (rows <= 384 without a partition: gemm2 is faster)
       (a.rows + 191) / 192 <= 65535) {
     const uint32_t partSteps = (a.partition ? a.partition : a.K) / 32;
@@ -389,10 +405,11 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   if (ptxGemm && a.batches == 1 && !a.broadcastInput && a.partition == 0 && a.N % 64 == 0 && splits == 1 &&
       (!a.residual || (a.scaleResidual && a.residual->format == Format::E4)) &&
       (a.rows + 63) / 64 <= 65535) {
+    check(a.weightByteOffset % 16 == 0, "PTX GEMM weight offset must be 16-byte aligned");
     uint32_t pflags = (a.residual ? 1u : 0u) | (a.silu ? 2u : 0u) | ((a.quantize || a.dualOutput) ? 4u : 0u) | (a.quantize ? 0u : 8u);
     const std::string entry = "gemm2_e4m3_K" + std::to_string(a.K) + "_f" + std::to_string(pflags);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-    VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights);
+    VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights) + a.weightByteOffset;
     VkDeviceAddress pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
     VkDeviceAddress pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
     VkDeviceAddress pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
@@ -414,9 +431,12 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     cudaLaunchTracked(commands, kernel.function, a.N / 64, (a.rows + 63) / 64, 1, kernel.threads ? kernel.threads : 128, 0, params, 23, a.chained);
     return;
   }
+  check(a.weightByteOffset == 0, "a weight offset needs the PTX GEMM route (single batch, N % 64 == 0, no partition)");
   if (a.chainWaitRows || a.chainWaitBands || a.chainSignal || a.chained)
     throw std::runtime_error("chained GEMM has no PTX route (" + stageLabel_ + ": " + std::to_string(a.rows) + "x" + std::to_string(a.K) +
                              "->" + std::to_string(a.N) + " p" + std::to_string(a.partition) + ")");
+  // No PTX route applies and the backend has no FP8 cooperative matrices (sm86): the exact software GEMM.
+  if (!g_nativeFp8) { gemmFp8Compat(commands, a); return; }
   uint32_t subgroups = 4, tiles = 1;
   chooseGemmShape(a.N, a.rows, a.batches * splits, context_.smCount(), subgroups, tiles);
   uint32_t tile = tiles * 16, blockRows = subgroups * 16;
@@ -665,7 +685,7 @@ uint32_t Kernels::vitGemmSignals(uint32_t rows, uint32_t N) {
 
 bool Kernels::ptxBlock32Enabled() {
   static const bool enabled = getenv("DLSS5VK_PTX_BLOCK32") ? atoi(getenv("DLSS5VK_PTX_BLOCK32")) != 0 : true;
-  return g_nativeFp8 && enabled;
+  return g_ptx && enabled;
 }
 
 void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& a) {
@@ -833,7 +853,7 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
 
 bool Kernels::ptxFfnEnabled() {
   static const bool enabled = getenv("DLSS5VK_PTX_FFN") ? atoi(getenv("DLSS5VK_PTX_FFN")) != 0 : true;
-  return g_nativeFp8 && enabled;
+  return g_ptx && enabled;
 }
 
 uint32_t Kernels::ffnRowTiles(uint32_t channels) {
@@ -957,7 +977,7 @@ void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalize
 
 bool Kernels::ptxGlobalAttentionEnabled() {
   static const bool enabled = getenv("DLSS5VK_PTX_ATTN") ? atoi(getenv("DLSS5VK_PTX_ATTN")) != 0 : true;
-  return g_nativeFp8 && enabled;
+  return g_ptx && enabled;
 }
 
 bool Kernels::globalAttentionPtx(uint32_t paddedTokens, const Activation* normalized) const {

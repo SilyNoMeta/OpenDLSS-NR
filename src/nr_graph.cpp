@@ -143,7 +143,9 @@ Graph::Routes Graph::routesFromEnvironment() {
 Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options)
     : routes_(routesFromEnvironment()), context_(context), model_(model), kernels_(kernels), geometry_(geometry),
       options_(options) {
-  if (!context_.nativeFp8()) {
+  // The compatibility backend has no fused kernel (they are cooperative-matrix GLSL or PTX); sm86 runs the fused
+  // PTX blocks, lowered.
+  if (context_.backend() == vk::Backend::Compat) {
     options_.fusedBlocks = false;
     routes_.fusePre = routes_.fusePool = routes_.fuseUpres = routes_.fusePost = false;
   }
@@ -513,7 +515,9 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
   constexpr int splitChain = 7;
   if (chain && !firstInStage && (splitChain & 4)) { w1.chainWaitBands = kernels_.syncAddress(block, Kernels::kSyncState); w1.chainWidth = width; w1.chainWaitMul = channels / 64; }
   kernels_.gemmFp8(commands, w1);
-  if (options_.fusedBlocks && !options_.captureIntermediates) {
+  // The fused branch MLP is cooperative-matrix GLSL only (no PTX twin): without FP8 cooperative matrices (sm86) the
+  // branches run as two batched GEMMs.
+  if (options_.fusedBlocks && !options_.captureIntermediates && context_.nativeFp8()) {
     const vk::Buffer& w2Weights =
         model_.fp8Matrix(branchTensor, w2Base, branches * branchChannels, middleChannels, true, branchChannels);
     // Fused MLP: W3 N-major per branch ([branch][64 n][256 k]).
@@ -528,14 +532,35 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
         model_.fp8Matrix(branchTensor, w2Base, branches * branchChannels, middleChannels, true, branchChannels);
     const vk::Buffer& w3Weights =
         model_.fp8Matrix(branchTensor, w3Base, branches * middleChannels, branchChannels, true, middleChannels);
-    GemmFp8Args w2;
-    w2.input = temps.branch; w2.rows = rows; w2.K = branchChannels; w2.N = middleChannels; w2.batches = branches;
-    w2.weights = &w2Weights; w2.Nmatrix = middleChannels; w2.output = temps.middle; w2.silu = true; w2.quantize = true;
-    kernels_.gemmFp8(commands, w2);
-    GemmFp8Args w3;
-    w3.input = temps.middle; w3.rows = rows; w3.K = middleChannels; w3.N = branchChannels; w3.batches = branches;
-    w3.weights = &w3Weights; w3.Nmatrix = branchChannels; w3.output = temps.layer0; w3.quantize = true;
-    kernels_.gemmFp8(commands, w3);
+    if (options_.fusedBlocks && !options_.captureIntermediates && Kernels::ptxGemmEnabled()) {
+      // No batched PTX GEMM: one single-batch GEMM per branch (its weights a tile-major block of K x N bytes), so the
+      // branches reach the tensor cores on the sm86 backend. The same products, sums and publications.
+      for (uint32_t b = 0; b < branches; ++b) {
+        GemmFp8Args w2;
+        w2.input = temps.branch; w2.inputColumnBase = b * branchChannels; w2.rows = rows; w2.K = branchChannels;
+        w2.N = middleChannels; w2.weights = &w2Weights; w2.weightByteOffset = b * branchChannels * middleChannels;
+        w2.Nmatrix = middleChannels; w2.output = temps.middle; w2.outputColumnOffset = b * middleChannels;
+        w2.silu = true; w2.quantize = true;
+        kernels_.gemmFp8(commands, w2);
+      }
+      for (uint32_t b = 0; b < branches; ++b) {
+        GemmFp8Args w3;
+        w3.input = temps.middle; w3.inputColumnBase = b * middleChannels; w3.rows = rows; w3.K = middleChannels;
+        w3.N = branchChannels; w3.weights = &w3Weights; w3.weightByteOffset = b * middleChannels * branchChannels;
+        w3.Nmatrix = branchChannels; w3.output = temps.layer0; w3.outputColumnOffset = b * branchChannels;
+        w3.quantize = true;
+        kernels_.gemmFp8(commands, w3);
+      }
+    } else {
+      GemmFp8Args w2;
+      w2.input = temps.branch; w2.rows = rows; w2.K = branchChannels; w2.N = middleChannels; w2.batches = branches;
+      w2.weights = &w2Weights; w2.Nmatrix = middleChannels; w2.output = temps.middle; w2.silu = true; w2.quantize = true;
+      kernels_.gemmFp8(commands, w2);
+      GemmFp8Args w3;
+      w3.input = temps.middle; w3.rows = rows; w3.K = middleChannels; w3.N = branchChannels; w3.batches = branches;
+      w3.weights = &w3Weights; w3.Nmatrix = branchChannels; w3.output = temps.layer0; w3.quantize = true;
+      kernels_.gemmFp8(commands, w3);
+    }
   }
 
   GemmFp8Args ffn;

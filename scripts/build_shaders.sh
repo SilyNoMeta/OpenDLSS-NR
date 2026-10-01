@@ -97,5 +97,8 @@ for f in 2 66 74 130 48; do
   "$python" "$root/scripts/ptx/block32_e4m3.py" "$f" "$ptx_out/block32_e4m3_f$f.ptx" >/dev/null
 done
 
+# The same kernels lowered to Ampere (sm_86, no FP8 instruction) for the sm86 backend
+"$python" "$root/scripts/ptx/lower_sm86.py" "$ptx_out" "$root/build/ptx_sm86"
+
 echo "shaders -> $shader_out"
-echo "PTX -> $ptx_out"
+echo "PTX -> $ptx_out, $root/build/ptx_sm86"

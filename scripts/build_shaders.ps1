@@ -74,3 +74,6 @@ foreach ($f in 2, 66, 74, 130, 48) {
   python (Join-Path $root "scripts\ptx\block32_e4m3.py") $f (Join-Path $ptxOut "block32_e4m3_f$f.ptx") | Out-Null
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }
+# The same kernels lowered to Ampere (sm_86, no FP8 instruction) for the sm86 backend: build/ptx_sm86
+python (Join-Path $root "scripts\ptx\lower_sm86.py") $ptxOut (Join-Path $root "build\ptx_sm86")
+if ($LASTEXITCODE -ne 0) { exit 1 }

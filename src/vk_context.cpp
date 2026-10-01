@@ -99,6 +99,7 @@ const FeatureField kFeatureFields[] = {
     NR_FEATURE(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR, shaderSubgroupClock),
     NR_FEATURE(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR, shaderDeviceClock),
     NR_FEATURE(VkPhysicalDeviceShaderSMBuiltinsFeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV, shaderSMBuiltins),
+    NR_FEATURE(VkPhysicalDeviceCudaKernelLaunchFeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV, cudaKernelLaunchFeatures),
 };
 #undef NR_FEATURE
 
@@ -158,6 +159,7 @@ const char* backendName(Backend backend) {
   switch (backend) {
     case Backend::Native: return "native";
     case Backend::Compat: return "compat";
+    case Backend::Sm86: return "sm86";
   }
   return "?";
 }
@@ -166,6 +168,8 @@ const char* backendDescription(Backend backend) {
   switch (backend) {
     case Backend::Native: return "native FP8 (E4M3 cooperative matrices and FP8 PTX: Ada, Hopper, Blackwell)";
     case Backend::Compat: return "compatibility (software E4M3 in scalar GLSL, no tensor cores, no fusion, no chaining)";
+    case Backend::Sm86:
+      return "sm86 (native PTX lowered to f16 tensor cores, compatibility GLSL elsewhere; not bit-exact to native)";
   }
   return "?";
 }
@@ -173,9 +177,9 @@ const char* backendDescription(Backend backend) {
 std::optional<Backend> requestedBackend() {
   const std::string text = lower(getenv("DLSS5VK_BACKEND") ? getenv("DLSS5VK_BACKEND") : "");
   if (text.empty() || text == "auto") return std::nullopt;
-  for (Backend backend : {Backend::Native, Backend::Compat})
+  for (Backend backend : {Backend::Native, Backend::Compat, Backend::Sm86})
     if (text == backendName(backend)) return backend;
-  throw std::runtime_error("DLSS5VK_BACKEND=" + text + ": expected auto, native or compat");
+  throw std::runtime_error("DLSS5VK_BACKEND=" + text + ": expected auto, native, compat or sm86");
 }
 
 uint32_t Context::validationErrors() { return g_validationErrors.load(); }
@@ -235,6 +239,14 @@ DeviceRequirements::DeviceRequirements(Backend backend, bool enable) : backend(b
                       {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
                        VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME,
                        VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_SHADER_CLOCK_EXTENSION_NAME});
+  } else if (backend == Backend::Sm86) {
+    // The compatibility GLSL plus PTX launches; the feature bit is enabled explicitly (the native chain predates it).
+    cuda.cudaKernelLaunchFeatures = on;
+    link(cuda);
+    executable.pipelineExecutableInfo = on;
+    link(executable);
+    extensions.insert(extensions.end(),
+                      {VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME});
   }
 }
 
@@ -249,6 +261,7 @@ DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& e
   const std::string pick = lower(getenv("DLSS5VK_DEVICE") ? getenv("DLSS5VK_DEVICE") : "");
   const bool pickIndex = !pick.empty() && std::all_of(pick.begin(), pick.end(), [](unsigned char c) { return std::isdigit(c); });
   // DLSS5VK_BACKEND: only that route is considered; auto tries them fastest first
+  // auto: native, else compat (exact); sm86 is chosen explicitly (DLSS5VK_BACKEND=sm86): it is not bit-exact
   const std::optional<Backend> requested = requestedBackend();
   std::vector<Backend> candidates = requested ? std::vector<Backend>{*requested}
                                               : std::vector<Backend>{Backend::Native, Backend::Compat};
@@ -284,7 +297,7 @@ DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& e
     if (!usable) continue;
     // a faster route first, then a discrete GPU, then NVIDIA (a hybrid laptop also lists its integrated GPU,
     // often first when Windows prefers power saving)
-    const int score = (*usable == Backend::Native ? 8 : 0) +
+    const int score = (*usable == Backend::Native ? 8 : *usable == Backend::Sm86 ? 4 : 0) +
                       (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 0) +
                       (properties.vendorID == kVendorNvidia ? 1 : 0);
     if (score > bestScore) {
@@ -306,6 +319,14 @@ DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& e
         "to \"High performance\" under Windows Settings > System > Display > Graphics, or pick a device with "
         "DLSS5VK_DEVICE=<index or name>.");
   if (count > 1 || getenv("DLSS5VK_DEVICE") || requested) fprintf(stderr, "Vulkan devices:\n%s", report.c_str());
+  if (best.backend == Backend::Sm86) {
+    // The lowered PTX targets sm_86 (f16 mma.sync, cp.async: compute capability 8.0 and up). On an Ada or newer GPU
+    // the native route is the one to run; refusing here keeps a slower, inexact route from being taken by mistake.
+    const std::optional<ComputeCapability> capability = computeCapability(best.physical);
+    if (!capability || !capability->atLeast(8, 0) || capability->atLeast(8, 9))
+      throw std::runtime_error("the sm86 backend needs an Ampere GPU (compute capability 8.0 to 8.7); this one is " +
+                               (capability ? capability->text() : std::string("of unknown compute capability")));
+  }
 
   // auto never falls back silently. A GPU that has FP8 tensor cores (compute capability 8.9 or later) but no native
   // route is a driver problem, not a reason to run the slow route: refuse unless the fallback was asked for.
