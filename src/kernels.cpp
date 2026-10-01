@@ -43,12 +43,12 @@ void check(bool condition, const char* message) {
 Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
   g_nativeFp8 = context.nativeFp8();
   ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + "/../ptx";
-  for (const char* name : {"window_normalize", "global_normalize", "preprocess"}) {
-    modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + name + ".spv");
-  }
-  // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) have a compatibility twin with the
-  // same arithmetic in software; the native backend never loads those.
-  for (const char* name : {"ops", "gemm_fp8", "gemm_f16", "window_attend", "global_attend"}) {
+  modules_["preprocess"] = context_.loadShaderModule(shaderDirectory + "/preprocess.spv");
+  // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) or an approximation the GLSL
+  // compiler may relax (the norms) have a compatibility twin with the same arithmetic in exact software; the native
+  // backend never loads those.
+  for (const char* name : {"ops", "gemm_fp8", "gemm_f16", "window_attend", "global_attend", "window_normalize",
+                           "global_normalize"}) {
     const std::string file = std::string(name) + (g_nativeFp8 ? "" : "_compat");
     modules_[name] = context_.loadShaderModule(shaderDirectory + "/" + file + ".spv");
   }

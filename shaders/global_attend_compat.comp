@@ -18,35 +18,34 @@ layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };   // 
 layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; };
 
 shared uvec4 qs[16u * 2u];                       // [query][16-component part]
-shared float16_t scores[16u * PADDED_TOKENS];
+shared float scores[16u * PADDED_TOKENS];   // half values, held in f32
 shared uvec4 weights[16u * (PADDED_TOKENS / 16u)];   // [query][16-key group]
 shared float16_t reciprocals[16];
 
-float16_t vitExpWeight(float16_t score) {
-  precise float16_t affine = fma(score, float16_t(0.08953946828842163), float16_t(1.7093614339828491));
-  affine = clamp(affine, float16_t(1.439453125), float16_t(1.9775390625));
-  return f16FromBits(((f16Bits(affine) << 4u) + 0x4000u) & 0xffffu);
+// Every half operation below is evaluated in f32 (exact, or one rounding) and published with the bit-level
+// roundF16 (see window_normalize_compat.comp).
+float vitExpWeight(float score) {
+  // the half fma of the native kernel, with its constants as the halves they are (0x2DBB, 0x3ED6): evaluated in f32
+  // it gives the same half for every half score (see ports/browser-webgpu/shaders/numerics.wgsl, vit_exp_weight)
+  float affine = clamp(roundF16(fma(score, 0.08953857421875, 1.708984375)), 1.439453125, 1.9775390625);
+  return float(f16FromBits(((f16Bits(float16_t(affine)) << 4u) + 0x4000u) & 0xffffu));
 }
 
-float16_t softmaxPair(uint row, uint base, uint pair, uint parity) {
+float addHalf32(float a, float b) { return roundF16(a + b); }
+
+float softmaxPair(uint row, uint base, uint pair, uint parity) {
   uint key = row * PADDED_TOKENS + base + pair * 2u + parity;
-  precise float16_t a = scores[key] + scores[key + 8u];
-  precise float16_t b = scores[key + 16u] + scores[key + 24u];
-  precise float16_t c = scores[key + 32u] + scores[key + 40u];
-  precise float16_t d = scores[key + 48u] + scores[key + 56u];
-  precise float16_t ab = a + b;
-  precise float16_t abc = ab + c;
-  return abc + d;
+  float a = addHalf32(scores[key], scores[key + 8u]);
+  float b = addHalf32(scores[key + 16u], scores[key + 24u]);
+  float c = addHalf32(scores[key + 32u], scores[key + 40u]);
+  float d = addHalf32(scores[key + 48u], scores[key + 56u]);
+  return addHalf32(addHalf32(addHalf32(a, b), c), d);
 }
 
-float16_t softmax64(uint row, uint base) {
-  precise float16_t e0 = softmaxPair(row, base, 0u, 0u) + softmaxPair(row, base, 1u, 0u);
-  precise float16_t e1 = e0 + softmaxPair(row, base, 2u, 0u);
-  precise float16_t even = e1 + softmaxPair(row, base, 3u, 0u);
-  precise float16_t o0 = softmaxPair(row, base, 0u, 1u) + softmaxPair(row, base, 1u, 1u);
-  precise float16_t o1 = o0 + softmaxPair(row, base, 2u, 1u);
-  precise float16_t odd = o1 + softmaxPair(row, base, 3u, 1u);
-  return even + odd;
+float softmax64(uint row, uint base) {
+  float even = addHalf32(addHalf32(addHalf32(softmaxPair(row, base, 0u, 0u), softmaxPair(row, base, 1u, 0u)), softmaxPair(row, base, 2u, 0u)), softmaxPair(row, base, 3u, 0u));
+  float odd = addHalf32(addHalf32(addHalf32(softmaxPair(row, base, 0u, 1u), softmaxPair(row, base, 1u, 1u)), softmaxPair(row, base, 2u, 1u)), softmaxPair(row, base, 3u, 1u));
+  return addHalf32(even, odd);
 }
 
 uint packCodes(uint c0, uint c1, uint c2, uint c3) { return c0 | (c1 << 8u) | (c2 << 16u) | (c3 << 24u); }
@@ -73,25 +72,23 @@ void main() {
     for (uint row = 0u; row < 16u; ++row) {
       float16_t s = adaFp8Fdpa16(qs[row * 2u], k0, float16_t(0.0));
       s = adaFp8Fdpa16(qs[row * 2u + 1u], k1, s);
-      scores[row * PADDED_TOKENS + key] = vitExpWeight(s);
+      scores[row * PADDED_TOKENS + key] = vitExpWeight(float(s));
     }
   }
   barrier();
 
   if (lane < 16u) {
-    precise float16_t total = float16_t(0.0);
-    for (uint base = 0u; base < PADDED_TOKENS; base += 64u) total = total + softmax64(lane, base);
+    float total = 0.0;
+    for (uint base = 0u; base < PADDED_TOKENS; base += 64u) total = addHalf32(total, softmax64(lane, base));
     uint padding = PADDED_TOKENS - pc.tokens;
-    if (padding > 0u) {
-      precise float16_t correction = float16_t(float(vitExpWeight(float16_t(0.0))) * float(padding));
-      total = total - correction;
-    }
-    reciprocals[lane] = float16_t(1.0 / float(total));
+    // the padding keys' exp(0) terms, subtracted once (exact product: a half times at most 63, then one rounding)
+    if (padding > 0u) total = roundF16(total - roundF16(vitExpWeight(0.0) * float(padding)));
+    reciprocals[lane] = reciprocalF16(float16_t(total));
   }
   for (uint i = lane; i < 16u * (PADDED_TOKENS / 16u); i += 32u) {
     uint row = i / (PADDED_TOKENS / 16u), group = i % (PADDED_TOKENS / 16u);
     uint codes[16];
-    for (uint j = 0u; j < 16u; ++j) codes[j] = e4m3CodeFromF16Bits(f16Bits(scores[row * PADDED_TOKENS + group * 16u + j]));
+    for (uint j = 0u; j < 16u; ++j) codes[j] = e4m3CodeFromF16Bits(f16Bits(float16_t(scores[row * PADDED_TOKENS + group * 16u + j])));
     weights[i] = uvec4(packCodes(codes[0], codes[1], codes[2], codes[3]), packCodes(codes[4], codes[5], codes[6], codes[7]),
                        packCodes(codes[8], codes[9], codes[10], codes[11]), packCodes(codes[12], codes[13], codes[14], codes[15]));
   }

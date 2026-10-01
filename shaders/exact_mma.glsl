@@ -122,6 +122,77 @@ float16_t adaF16Fdpa8(f16vec4 a0, f16vec4 a1, f16vec4 b0, f16vec4 b1, float16_t 
   return fixedToF16(fixedSum, maximumExponent - 24);
 }
 
+// The two approximations of the network (docs/numerics.md), correctly rounded to half in integer code. Native
+// evaluates them as rcp.approx.ftz.f32 / rsqrt.approx.ftz.f32 and then cvt.rn.f16; for every half input that is the
+// correctly rounded half (checked exhaustively on an Ampere GPU). GLSL's 1.0 / x and inversesqrt carry no such
+// guarantee, and the NVIDIA compiler was seen to evaluate float16_t(inversesqrt(float(x))) at reduced precision
+// (one ULP low on 554.5 in a window normalize), so the compatibility kernels do not rely on them.
+
+// A nonzero finite half as value = significand * 2^(exponent - 25), significand in [1024, 2047] (subnormals
+// normalised), exponent the biased half exponent (below 1 for a normalised subnormal).
+void halfParts(uint bits, out uint significand, out int exponent) {
+  uint e = (bits >> 10u) & 31u, m = bits & 0x3ffu;
+  if (e != 0u) { significand = m | 0x400u; exponent = int(e); return; }
+  uint shift = 10u - uint(findMSB(m));
+  significand = m << shift;
+  exponent = 1 - int(shift);
+}
+
+// (q + fraction) * 2^binaryExponent to half bits, round to nearest even: q a positive integer, `inexact` whether a
+// fraction below q's last bit is nonzero.
+uint roundToHalf(uint q, bool inexact, int binaryExponent) {
+  int msb = findMSB(q);
+  int valueExponent = msb + binaryExponent;
+  int shift = valueExponent >= -14 ? msb - 10 : -24 - binaryExponent;
+  uint kept;
+  if (shift <= 0) kept = q << uint(-shift);
+  else if (shift > 31) kept = 0u;
+  else {
+    kept = q >> uint(shift);
+    uint dropped = q & ((1u << uint(shift)) - 1u), halfway = 1u << uint(shift - 1);
+    if (dropped > halfway || (dropped == halfway && (inexact || (kept & 1u) != 0u))) kept += 1u;
+  }
+  if (valueExponent < -14) return min(kept, 0x400u);   // subnormal (0x400 is the smallest normal)
+  if (kept == 2048u) { kept = 1024u; valueExponent += 1; }
+  if (valueExponent >= 16) return 0x7c00u;
+  return (uint(valueExponent + 15) << 10u) | (kept - 1024u);
+}
+
+// round_f16(1 / x): 1 / x = (2^31 / s + fraction) * 2^(-6 - exponent).
+float16_t reciprocalF16(float16_t x) {
+  uint bits = f16Bits(x), sign = bits & 0x8000u;
+  if ((bits & 0x7fffu) == 0u) return f16FromBits(sign | 0x7c00u);
+  if ((bits & 0x7c00u) == 0x7c00u) return f16FromBits((bits & 0x3ffu) != 0u ? 0x7e00u : sign);
+  uint s; int e;
+  halfParts(bits, s, e);
+  return f16FromBits(sign | roundToHalf(0x80000000u / s, (0x80000000u % s) != 0u, -6 - e));
+}
+
+// sign(y^2 * s - 2^36) for y < 2^14, s < 2^12, exactly.
+int compareSquareScaled(uint y, uint s) {
+  uint high, low;
+  umulExtended(y * y, s, high, low);
+  if (high != 16u) return high > 16u ? 1 : -1;
+  return low != 0u ? 1 : 0;
+}
+
+// round_f16(1 / sqrt(x)) for x >= 0: with x = s2 * 2^t, t even, s2 in [1024, 4095], 1 / sqrt(x) =
+// (2^18 / sqrt(s2)) * 2^(-18 - t / 2); y = floor(2^18 / sqrt(s2)) from an f32 estimate, settled exactly.
+float16_t rsqrtF16(float16_t x) {
+  uint bits = f16Bits(x);
+  if ((bits & 0x7fffu) == 0u) return f16FromBits(0x7c00u);   // a zero row's norm: +inf, as native
+  if ((bits & 0x8000u) != 0u || (bits & 0x7c00u) == 0x7c00u)
+    return f16FromBits(((bits & 0x8000u) != 0u || (bits & 0x3ffu) != 0u) ? 0x7e00u : 0u);
+  uint s2; int t;
+  halfParts(bits, s2, t);
+  t -= 25;
+  if ((t & 1) != 0) { s2 *= 2u; t -= 1; }
+  uint y = uint(262144.0 / sqrt(float(s2)));
+  for (int i = 0; i < 4 && compareSquareScaled(y, s2) > 0; ++i) y -= 1u;
+  for (int i = 0; i < 4 && compareSquareScaled(y + 1u, s2) <= 0; ++i) y += 1u;
+  return f16FromBits(roundToHalf(y, compareSquareScaled(y, s2) != 0, -18 - t / 2));
+}
+
 // f16 + f16 rounded to half (the partition sums): the f32 sum, then RNE to half. Rounding twice is harmless here,
 // since f32 carries 24 >= 2 * 11 + 2 significand bits, so this is the half add's single rounding.
 float16_t addHalf(float16_t a, float16_t b) { return float16_t(roundF16(float(a) + float(b))); }

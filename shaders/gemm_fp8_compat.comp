@@ -78,7 +78,7 @@ void main() {
   }
   if (PARTITION != 0u) acc = total;
 
-  if ((FLAGS & F_SILU) != 0u) acc = siluHalf(acc);
+  if ((FLAGS & F_SILU) != 0u) acc = float16_t(mpCubicSilu(float(acc)));   // the f32 spelling: no half arithmetic left to the compiler
   if ((FLAGS & F_QUANTIZE) == 0u) outputF16[outputIndex] = acc;
   if ((FLAGS & (F_QUANTIZE | F_DUAL)) != 0u) outputE4[outputIndex] = uint8_t(e4m3CodeFromF16Bits(f16Bits(acc)));
 }

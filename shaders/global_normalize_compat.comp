@@ -1,0 +1,51 @@
+#version 460
+// Global-ViT cosine normalization for the compatibility backend: the function of global_normalize.comp, spelled
+// so that no rounding is left to the compiler (see window_normalize_compat.comp). The ViT's square sum keeps the low
+// square in f32: r[c] = f16(f32(v[c])^2 + f32(f16(v[c+16]^2))); then the stride 8/4/2/1 tree, the correctly
+// rounded norm, and Q's three half multiplies in order: the norm, sqrt(32), the learned scale.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "exact_mma.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+  uint tokens;
+  uint heads;
+  uint channels;
+  uint scaleWordOffset;
+} pc;
+
+layout(std430, binding = 1) readonly buffer Qkv { float16_t qkv[]; };
+layout(std430, binding = 4) readonly buffer Aux { uint aux32[]; };
+layout(std430, binding = 5) writeonly buffer Normalized { uint8_t normalized[]; };
+
+float squareSum(uint base) {
+  float r[16];
+  for (uint c = 0u; c < 16u; ++c) {
+    float low = float(qkv[base + c]), high = float(qkv[base + c + 16u]);
+    r[c] = roundF16(low * low + roundF16(high * high));
+  }
+  for (uint stride = 8u; stride > 0u; stride >>= 1u)
+    for (uint c = 0u; c < stride; ++c) r[c] = roundF16(r[c] + r[c + stride]);
+  return r[0];
+}
+
+void main() {
+  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+  if (id >= pc.tokens * pc.heads) return;
+  uint token = id / pc.heads;
+  uint head = id % pc.heads;
+  uint base = token * pc.channels * 3u + head * 96u;
+  float qNorm = float(rsqrtF16(float16_t(squareSum(base))));
+  float kNorm = float(rsqrtF16(float16_t(squareSum(base + 32u))));
+  float learnedScale = roundF16(uintBitsToFloat(aux32[pc.scaleWordOffset + head]));
+  float headScale = roundF16(sqrt(32.0));   // 5.65625 (sqrt(32) is 5.6569, a quarter ULP from either neighbour)
+  for (uint c = 0u; c < 32u; ++c) {
+    float nq = roundF16(roundF16(roundF16(float(qkv[base + c]) * qNorm) * headScale) * learnedScale);
+    float nk = roundF16(float(qkv[base + 32u + c]) * kNorm);
+    normalized[base + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(float16_t(nq))));
+    normalized[base + 32u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(float16_t(nk))));
+    normalized[base + 64u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(qkv[base + 64u + c])));
+  }
+}

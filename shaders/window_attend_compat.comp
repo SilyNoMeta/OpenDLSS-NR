@@ -29,7 +29,7 @@ layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; };
 shared uvec4 qs[64 * 2];           // [query][16-component half]: sixteen E4M3 codes per uvec4
 shared uvec4 ks[64 * 2];           // [physical key][half]
 shared uvec4 vs[4 * 32];           // [16-key group][component]: the sixteen keys of a group for one component
-shared float16_t scores[64 * 64];
+shared float scores[64 * 64];          // half values, held in f32
 shared uvec4 weights[64 * 4];      // [query][16-key group]
 
 uint inverseTiledToken(uint token) {
@@ -39,31 +39,29 @@ uint inverseTiledToken(uint token) {
   return y * 8u + x;
 }
 
-float16_t expWeight(float16_t score) {
-  precise float affine32 = fma(float(score), 0.044921875, 1.30078125);
-  float16_t affine = clamp(float16_t(affine32), float16_t(1.03125), float16_t(1.5693359375));
-  return f16FromBits(((f16Bits(affine) << 5u) + 0x8000u) & 0xffffu);
+// Every half operation below is evaluated in f32 (exact, or one rounding) and published with the bit-level
+// roundF16, so that no rounding is left to the compiler (see window_normalize_compat.comp).
+float expWeight(float score) {
+  // the product is exact in f32 (a half times 23 * 2^-9), so the f32 fma rounds once before the half publication
+  float affine = clamp(roundF16(fma(score, 0.044921875, 1.30078125)), 1.03125, 1.5693359375);
+  return float(f16FromBits(((f16Bits(float16_t(affine)) << 5u) + 0x8000u) & 0xffffu));
 }
 
-float16_t softmaxPair(uint row, uint pair, uint parity) {
-  uint key = pair * 2u + parity;
-  precise float16_t a = scores[row * 64u + key] + scores[row * 64u + key + 8u];
-  precise float16_t b = scores[row * 64u + key + 16u] + scores[row * 64u + key + 24u];
-  precise float16_t c = scores[row * 64u + key + 32u] + scores[row * 64u + key + 40u];
-  precise float16_t d = scores[row * 64u + key + 48u] + scores[row * 64u + key + 56u];
-  precise float16_t ab = a + b;
-  precise float16_t abc = ab + c;
-  return abc + d;
+float addHalf32(float a, float b) { return roundF16(a + b); }
+
+float softmaxPair(uint row, uint pair, uint parity) {
+  uint key = row * 64u + pair * 2u + parity;
+  float a = addHalf32(scores[key], scores[key + 8u]);
+  float b = addHalf32(scores[key + 16u], scores[key + 24u]);
+  float c = addHalf32(scores[key + 32u], scores[key + 40u]);
+  float d = addHalf32(scores[key + 48u], scores[key + 56u]);
+  return addHalf32(addHalf32(addHalf32(a, b), c), d);
 }
 
-float16_t softmaxSum(uint row) {
-  precise float16_t e0 = softmaxPair(row, 0u, 0u) + softmaxPair(row, 1u, 0u);
-  precise float16_t e1 = e0 + softmaxPair(row, 2u, 0u);
-  precise float16_t even = e1 + softmaxPair(row, 3u, 0u);
-  precise float16_t o0 = softmaxPair(row, 0u, 1u) + softmaxPair(row, 1u, 1u);
-  precise float16_t o1 = o0 + softmaxPair(row, 2u, 1u);
-  precise float16_t odd = o1 + softmaxPair(row, 3u, 1u);
-  return even + odd;
+float softmaxSum(uint row) {
+  float even = addHalf32(addHalf32(addHalf32(softmaxPair(row, 0u, 0u), softmaxPair(row, 1u, 0u)), softmaxPair(row, 2u, 0u)), softmaxPair(row, 3u, 0u));
+  float odd = addHalf32(addHalf32(addHalf32(softmaxPair(row, 0u, 1u), softmaxPair(row, 1u, 1u)), softmaxPair(row, 2u, 1u)), softmaxPair(row, 3u, 1u));
+  return addHalf32(even, odd);
 }
 
 uint packCodes(uint c0, uint c1, uint c2, uint c3) { return c0 | (c1 << 8u) | (c2 << 16u) | (c3 << 24u); }
@@ -120,18 +118,18 @@ void main() {
     float16_t s = prior[head * 4096u + i];
     s = adaFp8Fdpa16(qs[query * 2u], ks[key * 2u], s);
     s = adaFp8Fdpa16(qs[query * 2u + 1u], ks[key * 2u + 1u], s);
-    scores[i] = expWeight(s);
+    scores[i] = expWeight(float(s));
   }
   barrier();
 
   if (thread < 64u) {
     uint row = thread;
-    float16_t reciprocal = float16_t(1.0 / float(softmaxSum(row)));
+    float reciprocal = float(reciprocalF16(float16_t(softmaxSum(row))));
     for (uint group = 0u; group < 4u; ++group) {
       uint codes[16];
       for (uint i = 0u; i < 16u; ++i) {
-        precise float16_t normalized = scores[row * 64u + group * 16u + i] * reciprocal;
-        codes[i] = e4m3CodeFromF16Bits(f16Bits(normalized));
+        float normalized = roundF16(scores[row * 64u + group * 16u + i] * reciprocal);
+        codes[i] = e4m3CodeFromF16Bits(f16Bits(float16_t(normalized)));
       }
       weights[row * 4u + group] = uvec4(packCodes(codes[0], codes[1], codes[2], codes[3]), packCodes(codes[4], codes[5], codes[6], codes[7]),
                                         packCodes(codes[8], codes[9], codes[10], codes[11]), packCodes(codes[12], codes[13], codes[14], codes[15]));

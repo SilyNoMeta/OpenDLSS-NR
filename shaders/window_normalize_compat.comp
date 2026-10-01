@@ -1,0 +1,53 @@
+#version 460
+// Cosine-attention Q/K normalization for the compatibility backend: the function of window_normalize.comp and of
+// ref::windowNormalizeRef, spelled so that no rounding is left to the compiler. Every half operation is evaluated
+// in f32, where it is exact or rounds once, and published with the bit-level roundF16; the norm is the correctly
+// rounded half of exact_mma.glsl. (On an RTX 3070 Ti the native spelling, float16_t arithmetic and
+// float16_t(inversesqrt(...)), published one Q code differently from the reference in one of 2.6 million.)
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "exact_mma.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+  uint tokens;
+  uint heads;
+  uint channels;        // heads * 32
+  uint scaleWordOffset; // per-head f32 learned scale, in 32-bit words within binding 4
+} pc;
+
+layout(std430, binding = 1) readonly buffer Qkv { float16_t qkv[]; };   // [tokens][channels*3] raw half
+layout(std430, binding = 4) readonly buffer Aux { uint aux32[]; };
+layout(std430, binding = 5) writeonly buffer Normalized { uint8_t normalized[]; }; // E4M3 [tokens][channels*3]
+
+// Sum of squares in the specified order: r[c] = fma(v[c], v[c], f16(v[c+16]^2)) for 16 pairs (the f32 product of
+// two halves is exact, so the f32 add is the fused multiply-add's single rounding), then a stride 8/4/2/1 tree.
+float squareSum(uint base) {
+  float r[16];
+  for (uint c = 0u; c < 16u; ++c) {
+    float low = float(qkv[base + c]), high = float(qkv[base + c + 16u]);
+    r[c] = roundF16(low * low + roundF16(high * high));
+  }
+  for (uint stride = 8u; stride > 0u; stride >>= 1u)
+    for (uint c = 0u; c < stride; ++c) r[c] = roundF16(r[c] + r[c + stride]);
+  return r[0];
+}
+
+void main() {
+  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+  if (id >= pc.tokens * pc.heads) return;
+  uint token = id / pc.heads;
+  uint head = id % pc.heads;
+  uint base = token * pc.channels * 3u + head * 96u;
+  float qNorm = float(rsqrtF16(float16_t(squareSum(base))));
+  float kNorm = float(rsqrtF16(float16_t(squareSum(base + 32u))));
+  float scale = roundF16(uintBitsToFloat(aux32[pc.scaleWordOffset + head]));
+  for (uint c = 0u; c < 32u; ++c) {
+    float nq = roundF16(roundF16(float(qkv[base + c]) * qNorm) * scale);
+    float nk = roundF16(float(qkv[base + 32u + c]) * kNorm);
+    normalized[base + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(float16_t(nq))));
+    normalized[base + 32u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(float16_t(nk))));
+    normalized[base + 64u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(qkv[base + 64u + c])));
+  }
+}
