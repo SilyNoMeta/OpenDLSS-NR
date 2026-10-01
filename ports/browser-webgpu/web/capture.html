@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NR capture</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 2rem 1rem; background: #11131a; color: #d8dce6;
+         font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #log { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>NR capture</h1>
+<p>Runs the port on a proxy image and writes a parity fixture from its own output: the input features, every
+  block boundary and stage transition, the head and the composed image. Driven by <code>tools/capture.mjs</code>,
+  which receives the uploads. The result is a reference from this implementation, labelled as such in the
+  fixture; it is never a capture of native.</p>
+<div id="log"></div>
+<script type="module">
+import { Network } from '../src/network.js';
+import { REFERENCE_BOUNDARIES, truncateToHalf } from '../src/parity.js';
+
+const query = new URLSearchParams(location.search);
+const log = document.getElementById('log');
+const lines = [];
+const say = (text) => { lines.push(text); log.textContent = lines.join('\n'); console.log(text); };
+
+async function upload(path, data) {
+  const response = await fetch(`/upload/${encodeURIComponent(path)}`, { method: 'POST', body: data });
+  if (!response.ok) throw new Error(`upload ${path}: HTTP ${response.status}`);
+}
+const json = (value) => new TextEncoder().encode(JSON.stringify(value, null, 1));
+
+async function finish(text) {
+  say(text);
+  if (query.has('report')) await fetch('/report', { method: 'POST', body: lines.join('\n') }).finally(() => window.close());
+}
+
+try {
+  // The request: a proxy (RGBA f32, values in [0, 1]) and the conditioning the network is run with.
+  const requestUrl = query.get('request') ?? '/fixtures/request.json';
+  const request = await (await fetch(requestUrl)).json();
+  const base = requestUrl.slice(0, requestUrl.lastIndexOf('/'));
+  const proxy = new Float32Array(await (await fetch(`${base}/${request.proxy.file}`)).arrayBuffer());
+  const { width, height } = request.proxy;
+  if (proxy.length !== width * height * 4) throw new Error(`proxy holds ${proxy.length} floats, ${width}x${height} needs ${width * height * 4}`);
+  const network = await Network.create({
+    weights: query.get('weights') ?? '/weights', width, height, captureBoundaries: true,
+    onProgress: (text) => say(text),
+  });
+  const g = network.geometry;
+  say(`adapter: ${network.adapterInfo ? `${network.adapterInfo.vendor} / ${network.adapterInfo.architecture} / ${network.adapterInfo.description ?? ''}` : 'unknown'}`);
+  const manifestBase = {
+    sourceDimensions: [width, height], fullDimensions: [g.fullWidth, g.fullHeight],
+    provenance: {
+      implementation: 'ports/browser-webgpu (WGSL, exact fixed-point emulation of the E4M3 tensor-core arithmetic)',
+      note: 'a reference produced by this port, not a capture of native',
+      adapter: network.adapterInfo ? `${network.adapterInfo.vendor} ${network.adapterInfo.architecture}` : 'unknown',
+      request: request.label ?? '',
+    },
+  };
+
+  await network.featuresFromProxy(proxy, { proxy: request.proxy, conditioning: request.conditioning, seed: request.seed,
+                                           autoMask: request.autoMask });
+  const features = (await network.readTensorByLabel('input features')).bytes;
+  await network.run();
+  // A second run on the same buffers must give the same head: the capture is of a deterministic frame.
+  const head = await network.readHead();
+  await network.run();
+  const again = await network.readHead();
+  const headBits = new Uint32Array(head.buffer), againBits = new Uint32Array(again.buffer);
+  for (let i = 0; i < headBits.length; ++i) if (headBits[i] !== againBits[i]) throw new Error(`head changed between runs at ${i}`);
+
+  const blocks = [], transitions = [];
+  for (const name of REFERENCE_BOUNDARIES) {
+    const tensor = network.graph.boundaries.get(name);
+    if (!tensor) throw new Error(`the graph captured no ${name}`);
+    const level = g.levels.find((l) => l.rows === tensor.rows) ?? (tensor.rows === g.fullRows ? { width: g.fullWidth, height: g.fullHeight } : null);
+    if (!level) throw new Error(`${name}: ${tensor.rows} rows match no level`);
+    const file = `boundaries/${name}.u8`;
+    await upload(file, await network.readBoundary(name));
+    const entry = { width: level.width, height: level.height, channels: tensor.channels, file };
+    if (name.startsWith('block-')) blocks.push({ block: Number(name.slice(6)), ...entry });
+    else transitions.push({ id: name.slice('transition-'.length), ...entry });
+  }
+  await upload('features.f32', features);
+  await upload('head.f32', head);
+  await upload('proxy.f32', proxy);
+
+  // The composed image, RGBA f32 halves, as the C++ and this port's parity compose it (alpha is the proxy's).
+  const output = new Float32Array(width * height * 4);
+  const fma32 = (a, b, c) => Math.fround(a * b + c);
+  for (let y = 0; y < height; ++y)
+    for (let x = 0; x < width; ++x) {
+      const p = (y * width + x) * 4;
+      for (let c = 0; c < 3; ++c) {
+        const centred = fma32(proxy[p + c], 0.125, -0.0625);
+        const inner = fma32(head[(y * g.fullWidth + x) * 4 + c], 0.03125, centred);
+        output[p + c] = truncateToHalf(Math.min(Math.max(Math.fround(inner * 8 + 0.5), 0), 1));
+      }
+      output[p + 3] = Math.min(Math.max(proxy[p + 3], 0), 1);
+    }
+  await upload('output.f32', output);
+
+  // Two fixtures over the same run: the features one gates every boundary and the head from recorded features
+  // (the noise lanes are not part of the comparison); the proxy one generates the features again and gates the
+  // head and the composed image (the noise lanes are).
+  await upload('features/manifest.json', json({
+    ...manifestBase, checks: ['boundaries', 'head'],
+    inputFeatures: { file: '../features.f32' },
+    blocks: blocks.map((b) => ({ ...b, file: `../${b.file}` })),
+    transitions: transitions.map((t) => ({ ...t, file: `../${t.file}` })),
+    referenceHead: { file: '../head.f32' },
+  }));
+  await upload('proxy/manifest.json', json({
+    ...manifestBase, checks: ['head', 'output'],
+    proxy: { width, height, file: '../proxy.f32' },
+    conditioning: request.conditioning, seed: request.seed, autoMask: request.autoMask,
+    referenceHead: { file: '../head.f32' },
+    nativeOutput: { width, height, dtype: 'f32', file: '../output.f32' },
+  }));
+  await finish(`CAPTURE DONE ${width}x${height} (full ${g.fullWidth}x${g.fullHeight}): ${blocks.length} blocks, ` +
+               `${transitions.length} transitions, head and output, ${network.recorder.dispatchCount} dispatches`);
+} catch (error) {
+  await finish(`CAPTURE ERROR: ${error.stack ?? error}`);
+}
+</script>
+</body>
+</html>

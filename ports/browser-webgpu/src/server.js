@@ -46,7 +46,7 @@ function mounts() {
   ].filter((mount) => mount.directory);
 }
 
-export function startServer({ port = 8099, host = '127.0.0.1', onReport } = {}) {
+export function startServer({ port = 8099, host = '127.0.0.1', onReport, onUpload } = {}) {
   const extra = mounts();
   const server = createServer(async (request, response) => {
     try {
@@ -58,6 +58,16 @@ export function startServer({ port = 8099, host = '127.0.0.1', onReport } = {}) 
         const body = Buffer.concat(chunks).toString();
         response.writeHead(204).end();
         (onReport ?? console.log)(body);
+        return;
+      }
+
+      // tools/capture.mjs: the capture page posts each tensor it produced, binary, to /upload/<relative path>.
+      // Only a host that asked for uploads accepts them, and the path stays relative (onUpload checks it).
+      if (request.method === 'POST' && url.pathname.startsWith('/upload/') && onUpload) {
+        const chunks = [];
+        for await (const chunk of request) chunks.push(chunk);
+        await onUpload(decodeURIComponent(url.pathname.slice('/upload/'.length)), Buffer.concat(chunks));
+        response.writeHead(204).end();
         return;
       }
 

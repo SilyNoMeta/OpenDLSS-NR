@@ -3,6 +3,8 @@
 //   node tools/headless.mjs selftest
 //   node tools/headless.mjs parity
 //   NR_HEADED=1 node tools/headless.mjs demo      (a real window, to watch rather than to gate on)
+//   NR_FIXTURES=<dir with request.json> NR_CAPTURE_OUT=<dir> node tools/headless.mjs capture
+//                                                 (writes a fixture from this port's own output, web/capture.html)
 //
 // A server is started on an unused port, Chrome is pointed at the page with ?report=1, and the page posts its
 // result back before closing itself. Set CHROME to a browser path if the usual locations are wrong.
@@ -12,13 +14,13 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 
 import { startServer } from '../src/server.js';
 
-const pages = { selftest: 'web/selftest.html', parity: 'web/parity.html', demo: 'demo/index.html' };
+const pages = { selftest: 'web/selftest.html', parity: 'web/parity.html', demo: 'demo/index.html', capture: 'web/capture.html' };
 
 const which = process.argv[2] ?? 'selftest';
 const extraQuery = process.argv[3] ?? '';
@@ -41,7 +43,21 @@ if (!chrome) {
   process.exit(2);
 }
 
-const server = await startServer({ port: 0, onReport: report });
+// The capture page uploads what it produced; only that page gets somewhere to write, and only below NR_CAPTURE_OUT.
+const captureOut = which === 'capture' ? process.env.NR_CAPTURE_OUT : null;
+if (which === 'capture' && !captureOut) {
+  console.error('the capture page needs NR_CAPTURE_OUT (where the fixture is written) and NR_FIXTURES (the request)');
+  process.exit(2);
+}
+async function upload(relative, bytes) {
+  const base = resolve(captureOut);
+  const target = resolve(base, normalize(relative));
+  if (isAbsolute(relative) || !target.startsWith(base + sep)) throw new Error(`refusing to write outside ${base}: ${relative}`);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, bytes);
+}
+
+const server = await startServer({ port: 0, onReport: report, onUpload: captureOut ? upload : undefined });
 const port = server.address().port;
 const profile = await mkdtemp(join(tmpdir(), 'nr-headless-'));
 
