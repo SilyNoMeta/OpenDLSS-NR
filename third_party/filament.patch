@@ -110,7 +110,7 @@ index 2067d874..f3b37c64 100644
      // the fn function will execute a batch of driver commands
      // this gives the driver a chance to wrap their execution in a meaningful manner
 diff --git a/filament/backend/src/vulkan/VulkanDriver.cpp b/filament/backend/src/vulkan/VulkanDriver.cpp
-index 5c4f5aef..08c0871d 100644
+index 5c4f5aef..a10b9069 100644
 --- a/filament/backend/src/vulkan/VulkanDriver.cpp
 +++ b/filament/backend/src/vulkan/VulkanDriver.cpp
 @@ -35,6 +35,8 @@
@@ -122,7 +122,7 @@ index 5c4f5aef..08c0871d 100644
  #include <backend/DriverEnums.h>
  #include <backend/platforms/VulkanPlatform.h>
  
-@@ -3031,6 +3033,82 @@ void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
+@@ -3031,6 +3033,85 @@ void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
      mQueryManager.endQuery(&(mCommands.get()), vtq);
  }
  
@@ -198,6 +198,9 @@ index 5c4f5aef..08c0871d 100644
 +    Context context{ *this };
 +    if (command) {
 +        command(context);
++        // Executing secondary buffers invalidates the primary's bindings. The interop callback
++        // may also bind pipelines / descriptors directly, outside Filament's state cache.
++        invalidateBoundState();
 +    }
 +    return true;
 +}
@@ -218,6 +221,63 @@ index 8b513e4e..6a343cc7 100644
      VulkanDriver(VulkanDriver const&) = delete;
      VulkanDriver& operator=(VulkanDriver const&) = delete;
  
+diff --git a/filament/backend/src/vulkan/VulkanPipelineCache.cpp b/filament/backend/src/vulkan/VulkanPipelineCache.cpp
+index 7a08e251..a63661f0 100644
+--- a/filament/backend/src/vulkan/VulkanPipelineCache.cpp
++++ b/filament/backend/src/vulkan/VulkanPipelineCache.cpp
+@@ -125,6 +125,13 @@ void VulkanPipelineCache::bindPipeline(VulkanCommandBuffer* commands) {
+     // If an error occurred, allow higher levels to handle it gracefully.
+     assert_invariant(cacheEntry != nullptr && "Failed to create/find pipeline");
+ 
++    // A skipped frame can advance cache age while the GPU is still executing an older frame.
++    // Keep every submission that references this pipeline, including the command being recorded.
++    auto fence = commands->getFenceStatus();
++    if (cacheEntry->pending.empty() || cacheEntry->pending.back() != fence) {
++        cacheEntry->pending.push_back(std::move(fence));
++    }
++
+ 
+     static PipelineEqual equal;
+     if (!equal(mBoundPipeline, mPipelineRequirements)) {
+@@ -538,10 +545,15 @@ void VulkanPipelineCache::gc() noexcept {
+ 
+     // Evict any pipelines that have not been used in a while.
+     // Any pipeline older than FVK_MAX_COMMAND_BUFFERS can be safely destroyed.
+-   using ConstPipeIterator = decltype(mPipelines)::const_iterator;
++   using ConstPipeIterator = decltype(mPipelines)::iterator;
+    for (ConstPipeIterator iter = mPipelines.begin(); iter != mPipelines.end();) {
+-       const PipelineCacheEntry& cacheEntry = iter.value();
+-       if (cacheEntry.lastUsed + FVK_MAX_PIPELINE_AGE < mCurrentTime) {
++       PipelineCacheEntry& cacheEntry = iter.value();
++       auto& pending = cacheEntry.pending;
++       pending.erase(std::remove_if(pending.begin(), pending.end(), [this](auto const& fence) {
++           fence->refreshStatus(mDevice);
++           return fence->getStatus() == VK_SUCCESS;
++       }), pending.end());
++       if (cacheEntry.lastUsed + FVK_MAX_PIPELINE_AGE < mCurrentTime && pending.empty()) {
+            vkDestroyPipeline(mDevice, iter->second.handle, VKALLOC);
+            iter = mPipelines.erase(iter);
+        } else {
+diff --git a/filament/backend/src/vulkan/VulkanPipelineCache.h b/filament/backend/src/vulkan/VulkanPipelineCache.h
+index a5cf1e02..79dd7ee7 100644
+--- a/filament/backend/src/vulkan/VulkanPipelineCache.h
++++ b/filament/backend/src/vulkan/VulkanPipelineCache.h
+@@ -34,6 +34,7 @@
+ #include <tsl/robin_map.h>
+ 
+ #include <type_traits>
++#include <vector>
+ 
+ namespace filament::backend {
+ 
+@@ -229,6 +230,7 @@ private:
+     struct PipelineCacheEntry {
+         VkPipeline handle;
+         Timestamp lastUsed;
++        std::vector<std::shared_ptr<VulkanCmdFence>> pending;
+     };
+ 
+     using PipelineMap = tsl::robin_map<PipelineKey, PipelineCacheEntry,
 diff --git a/filament/include/filament/Engine.h b/filament/include/filament/Engine.h
 index c8d6e6de..b3264711 100644
 --- a/filament/include/filament/Engine.h
@@ -1315,7 +1375,7 @@ index 86043b4f..c20ac244 100644
          { +PerRenderableBindingPoints::MORPH_TARGET_TANGENTS,       "sampler1_tangents"sv },
          { +PerRenderableBindingPoints::BONES_INDICES_AND_WEIGHTS,   "sampler1_indicesAndWeights"sv },
 diff --git a/libs/filabridge/src/Variant.cpp b/libs/filabridge/src/Variant.cpp
-index 0a1d92e8..9ede4588 100644
+index 0a1d92e8..298645b3 100644
 --- a/libs/filabridge/src/Variant.cpp
 +++ b/libs/filabridge/src/Variant.cpp
 @@ -1,243 +1,243 @@

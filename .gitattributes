@@ -3,3 +3,5 @@
 
 # the Filament patch is applied byte for byte to an LF checkout: no line-ending conversion
 *.patch -text
+# Unified diffs use a single space for empty context lines.
+*.patch whitespace=-blank-at-eol

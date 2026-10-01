@@ -5,22 +5,26 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
 
 #include "vk_context.h"
 
 namespace {
+std::atomic<uint32_t> validationErrorCount{0};
 
 // DLSS5_DEMO_VALIDATION=1: the Khronos validation layer (needs a Vulkan SDK) with a debug messenger
 bool wantsValidation() { return getenv("DLSS5_DEMO_VALIDATION") != nullptr; }
 
 VkBool32 VKAPI_PTR debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
                                  const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ++validationErrorCount;
   if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT))
     fprintf(stderr, "[vk] %s\n", data->pMessage ? data->pMessage : "");
   return VK_FALSE;
 }
 
 }  // namespace
+uint32_t VulkanDevice::validationErrors() { return validationErrorCount.load(); }
 
 VulkanDevice::VulkanDevice() {
   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("the Vulkan loader (vulkan-1) is unavailable");
@@ -55,6 +59,11 @@ VulkanDevice::VulkanDevice() {
   instanceInfo.pApplicationInfo = &app;
   instanceInfo.enabledExtensionCount = (uint32_t)instanceExtensions.size();
   instanceInfo.ppEnabledExtensionNames = instanceExtensions.data();
+  const VkValidationFeatureEnableEXT syncValidation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+  VkValidationFeaturesEXT validationFeatures{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+  validationFeatures.enabledValidationFeatureCount = 1;
+  validationFeatures.pEnabledValidationFeatures = &syncValidation;
+  if (validation) instanceInfo.pNext = &validationFeatures;
   if (validation) { instanceInfo.enabledLayerCount = 1; instanceInfo.ppEnabledLayerNames = layers; }
 #if defined(__APPLE__)
   instanceInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
@@ -141,8 +150,10 @@ VulkanDevice::VulkanDevice() {
   handles_.rendererQueueIndex = 0;
   handles_.nrQueueIndex = queueCount - 1;
   handles_.debugUtils = validation;
-  fprintf(stderr, "[vk] %s, %s, queue family %u (%u queue%s)\n", deviceName_.c_str(),
-          nativeFp8 ? "native FP8" : "software E4M3 compatibility", family, queueCount, queueCount > 1 ? "s" : "");
+  handles_.backend = (uint32_t)backend_;
+  handles_.createInfo = &createInfo_;
+  fprintf(stderr, "[vk] %s, %s backend (%s), queue family %u (%u queue%s)\n", deviceName_.c_str(),
+          vk::backendName(backend_), choice.reason.c_str(), family, queueCount, queueCount > 1 ? "s" : "");
 }
 
 VulkanDevice::~VulkanDevice() {

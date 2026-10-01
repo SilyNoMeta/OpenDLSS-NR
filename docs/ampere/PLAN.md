@@ -57,19 +57,23 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
 - [x] measured: Ampere f16 HMMA (m16n8k16) on decoded E4M3 equals Ada's F13 group in 74.6% of groups with an f16
       accumulator, 90.3% with an f32 accumulator and an RN publication per group; so this route is a tolerance
       route, not a bit-exact one
-- [ ] PTX lowering for sm86: E4M3 MMA -> two f16 MMAs with exact operand decode, E4M3 conversions in integer code
-- [ ] launch through `VK_NV_cuda_kernel_launch`; dynamic shared memory above 48 KiB checked on this driver
-- [ ] barriers first (`DLSS5VK_CHAIN=0`), then chaining only after progress / ordering / no-hang validation
-- [ ] numerical comparison against the exact route: bytes, tolerance, image metrics (stated separately)
-- [ ] performance: same model, inputs, size, passes; preparation vs recurring cost, memory
+- [x] PTX lowering to sm80 ISA for sm86: two f16 MMAs, exact operand conversion; 78 variants assembled
+- [x] full engine launches through `VK_NV_cuda_kernel_launch`, including dynamic shared memory above 48 KiB
+- [x] barriers default; opt-in chaining compared for repeatability/progress, not enabled automatically
+- [x] composed-output comparisons on six fixtures; sm86 differs and remains experimental
+- [~] performance: final controlled rerun, setup/synchronization/memory report pending
+- [x] backend flags isolated per Kernels instance; concurrent sm86/compat contexts and borrowed enabled-bit checks pass
 
 ## 6. Demo and temporal path
 
-- [ ] Filament build, demo on the compatibility and sm86 routes
-- [ ] motion, reset, resize, NR on/off, history
+- [x] Filament and demo Windows builds; sm86 scripted run (motion/toggle/resize)
+- [x] compat demo pipeline eviction fixed with submission fences; 250 frames pass synchronization validation without CPU serialization
+- [x] CPU reprojection/history verification on compat and sm86: 160x120 -> 233x137, Fox skinning/camera motion, reset, NR off/on
+- [x] sm86 second 250-frame run: all 11 captured histories byte-identical; renderer inputs identical between backends
+- [~] larger sm86 demo, no-temporal control and final performance/fixture reruns
 
 ## 7. Documentation and delivery
 
-- [ ] provenance, backends, build, commands, results, limitations, hardware
-- [ ] integration contract for DLSSG-Transfusion (inputs/outputs, model, device/queue, sync, resources, history)
+- [~] provenance, backends, build, commands, results, limitations, hardware
+- [~] integration contract drafted; review against final synchronization behavior pending
 - [~] audited pushes to `origin/feat/sm86` (no force-push, no private data, no binaries)

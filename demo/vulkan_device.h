@@ -16,6 +16,7 @@ class VulkanDevice {
   const GpuDevice& handles() const { return handles_; }
   const std::string& deviceName() const { return deviceName_; }
   vk::Backend backend() const { return backend_; }
+  static uint32_t validationErrors();
 
  private:
   GpuDevice handles_;

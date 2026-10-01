@@ -129,7 +129,7 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
   for (Image& h : history_)
-    h = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    h = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT);
   output_ = createImage(width, height, VK_FORMAT_R8G8B8A8_UNORM,
                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -166,7 +166,7 @@ void NrPass::fallBackToBarriers() {
   const nr::Kernels::ChainTimeouts timeouts = kernels_->chainTimeouts();
   fprintf(stderr, "[nr] %u chained wait(s) timed out, the first on %s: that frame was wrong; rebuilding with barriers\n",
           timeouts.waits, timeouts.counter.c_str());
-  nr::Kernels::setChainEnabled(false);
+  kernels_->setChainEnabled(false);
   destroySized();
   createSized(width_, height_);
   kernels_->resetChainTimeouts();
@@ -348,6 +348,7 @@ NrPass::Frame NrPass::beginFrame(const NrControls& controls, const float backgro
   block.styleStrength = controls.styleStrength; block.styleMode = controls.styleCustom ? 1u : 0u;
   static_assert(sizeof(ParamsBlock) <= sizeof(frame.params));
   memcpy(frame.params, &block, sizeof(block));
+  lastFrame_ = frame;
   return frame;
 }
 
@@ -404,6 +405,14 @@ void NrPass::buildComputeCommands() {
 void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& color, const GpuImage& velocity, const GpuImage& output) {
   VkCommandBuffer commands = (VkCommandBuffer)commandBuffer;
   const uint32_t h = frame.parity;
+  // NR reuses its graph and parameter buffers. Order prior shader reads before the next
+  // parameter update and prior graph writes before this frame's compute accesses.
+  VkMemoryBarrier reuse{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  reuse.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  reuse.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       0, 1, &reuse, 0, nullptr, 0, nullptr);
   // views onto the renderer's images; when they changed (first frame, resize) the descriptor sets and the
   // pre-recorded command buffers that reference them are rebuilt (nothing of them is pending then)
   bool changed = bindExternal(color_, color);
@@ -525,8 +534,20 @@ void NrPass::saveRaw(const std::string& path, int kind) {
     file.write((const char*)bytes.data(), bytes.size());
     return;
   }
+  if (kind == 3 || kind == 6) {
+    const nr::Activation& a = kind == 3 ? graph_->head() : *features_;
+    auto bytes = context_->download(a.buffer, a.validBytes());
+    std::ofstream file(path, std::ios::binary);
+    uint32_t header[3] = {width_, height_, a.channels};
+    file.write((const char*)header, sizeof(header));
+    for (uint32_t y = 0; y < height_; ++y)
+      file.write((const char*)bytes.data() + (size_t)y * geometry_.fullWidth * a.channels * 4, (size_t)width_ * a.channels * 4);
+    return;
+  }
   const uint32_t bytesPerPixel = 8, channels = 3;   // rgba16f both: scene rgb; motion x, y and history 1 / 0
-  std::vector<uint8_t> bytes = readImage(kind == 0 ? color_.image : sceneMotion_.image, bytesPerPixel,
+  VkImage source = kind == 0 ? color_.image : kind == 4 ? history_[lastFrame_.parity].image :
+                   kind == 5 ? history_[1 - lastFrame_.parity].image : sceneMotion_.image;
+  std::vector<uint8_t> bytes = readImage(source, bytesPerPixel,
                                          kind == 0 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL);
   std::vector<float> out((size_t)width_ * height_ * channels);
   const uint16_t* half = (const uint16_t*)bytes.data();
@@ -536,4 +557,17 @@ void NrPass::saveRaw(const std::string& path, int kind) {
   uint32_t header[3] = {width_, height_, channels};
   file.write((const char*)header, sizeof(header));
   file.write((const char*)out.data(), out.size() * sizeof(float));
+}
+
+void NrPass::saveVerification(const std::string& prefix) {
+  const char* names[] = {"scene", "motion", "velocity", "head", "previous", "history", "features"};
+  for (int i = 0; i < 7; ++i) saveRaw(prefix + "-" + names[i] + ".raw", i);
+  ParamsBlock p{}; memcpy(&p, lastFrame_.params, sizeof(p));
+  std::ofstream f(prefix + "-frame.json");
+  f.precision(9);
+  f << "{\"frame\":" << frames_ << ",\"seed\":" << p.seed << ",\"enabled\":" << p.nrEnabled
+    << ",\"historyValid\":" << p.historyValid << ",\"paperWhite\":" << p.paperWhite
+    << ",\"blendScale\":" << p.blendScale << ",\"backend\":\"" << vk::backendName(context_->backend()) << "\",\"background\":[";
+  for (int i = 0; i < 16; ++i) f << (i ? "," : "") << lastFrame_.background[i];
+  f << "]}\n";
 }

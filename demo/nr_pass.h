@@ -86,6 +86,8 @@ class NrPass {
   // 1 / 0 = the previous position on / off screen), 2 = the renderer's velocity buffer (rgba32ui: id, depth bits, motion bits)
   void saveOutput(const std::string& path, bool sceneInstead = false);
   void saveRaw(const std::string& path, int kind);
+  // Local verification data only, emitted by --capture with the renderer idle.
+  void saveVerification(const std::string& prefix);
 
  private:
   struct Image {
@@ -139,5 +141,6 @@ class NrPass {
   VkQueryPool queries_[2]{};       // per history parity: read when that parity comes around again
   std::atomic<bool> queriesWritten_[2]{};
   NrTimings timings_;
+  Frame lastFrame_{};
   uint32_t frames_ = 0, framesSinceReset_ = 0, historyIndex_ = 0;
 };

@@ -74,6 +74,8 @@ struct Options {
   NrControls controls;
   int style = 0, networkStyle = 0;
   int maxFps = 0;   // 0: uncapped (the swapchain's pacing only); a cap saves power and heat on a laptop
+  int resizeAt = 0;                       // scripted run: resize the window at this frame (0: never)
+  uint32_t resizeWidth = 0, resizeHeight = 0;
 };
 
 struct FirstPersonCamera {
@@ -119,7 +121,7 @@ std::string readFile(const std::string& path) {
 const char* kUsage = "usage: dlss5-demo [scene.gltf|.glb [environment.hdr]] --model <nr model dir> [--scenes <dir>] [--width w --height h] "
                      "[--frames n] [--capture prefix] [--orbit deg] [--view px,py,pz,tx,ty,tz[,fov]] [--nr 0|1] [--temporal 0|1] "
                      "[--style 0..3] [--style-knobs exposure,contrast,gamma,saturation,hue,vibrance,strength[,networkStyle]] [--intensity x] "
-                     "[--animation n] [--max-fps n]";
+                     "[--animation n] [--max-fps n] [--resize-at frame,WxH]";
 
 Options parseOptions(int argc, char** argv) {
   Options o;
@@ -139,6 +141,10 @@ Options parseOptions(int argc, char** argv) {
     else if (a == "--orbit") { next(v); o.orbitDegreesPerFrame = (float)atof(v.c_str()); }
     else if (a == "--animation") { next(v); o.animation = atoi(v.c_str()); }
     else if (a == "--max-fps") { next(v); o.maxFps = std::max(atoi(v.c_str()), 0); }
+    else if (a == "--resize-at") {   // frame,WxH: the scripted run resizes the window there (through SDL, as a user would)
+      next(v);
+      if (sscanf(v.c_str(), "%d,%ux%u", &o.resizeAt, &o.resizeWidth, &o.resizeHeight) != 3) fail("--resize-at frame,WxH");
+    }
     else if (a == "--temporal") { next(v); o.controls.temporal = atoi(v.c_str()) != 0; }
     else if (a == "--nr") { next(v); o.controls.enabled = atoi(v.c_str()) != 0; }
     else if (a == "--intensity") { next(v); o.controls.intensity = (float)atof(v.c_str()); }
@@ -424,6 +430,7 @@ int main(int argc, char** argv) {
     std::string prefix = options.capturePrefix.empty() ? "capture" : options.capturePrefix;
     nr->saveOutput(prefix + "-" + name + ".ppm", false);
     nr->saveOutput(prefix + "-" + name + "-scene.ppm", true);
+    nr->saveVerification(prefix + "-" + name);
     fprintf(stderr, "[demo] captured %s-%s.ppm\n", prefix.c_str(), name.c_str());
   };
 
@@ -515,6 +522,8 @@ int main(int argc, char** argv) {
     if (!renderer->beginFrame(swapChain)) { SDL_Delay(1); continue; }
     auto now = std::chrono::high_resolution_clock::now();
     float dt = std::min(std::chrono::duration<float>(now - lastTime).count(), 0.1f);
+    // the scripted run steps the animation at a fixed 60 Hz, so two runs (two backends) see the same frames
+    if (!options.capturePrefix.empty()) dt = 1.0f / 60.0f;
     lastTime = now;
     fpsFrames++;
     if (std::chrono::duration<float>(now - fpsTime).count() >= 0.5f) {
@@ -693,7 +702,17 @@ int main(int argc, char** argv) {
         autoOrbit = false;
       }
       if (f == 160) { capture("nr-settled"); controls.enabled = false; historyReset = true; }
+      if (f == 120) { capture("before-reset"); historyReset = true; }
+      if (f == 121) capture("reset");
+      if (f == 161) capture("disabled");
       if (f == 200) { capture("nr-off"); controls.enabled = true; historyReset = true; }
+      if (f == 201) capture("reenabled");
+      if (options.resizeAt > 0 && f == (uint32_t)options.resizeAt + 1) capture("resize-reset");
+      if (options.resizeAt > 0 && f == (uint32_t)options.resizeAt) {
+        capture("pre-resize");
+        SDL_SetWindowSize(window, (int)options.resizeWidth, (int)options.resizeHeight);   // the event path resizes
+      }
+      if (options.resizeAt > 0 && f == (uint32_t)options.resizeAt + 30) capture("resized");
     }
     if (options.frames > 0 && (int)frameIndex >= options.frames) running = false;
   }
@@ -725,5 +744,7 @@ int main(int argc, char** argv) {
   device.reset();
   SDL_DestroyWindow(window);
   SDL_Quit();
-  return 0;
+  const uint32_t errors = VulkanDevice::validationErrors();
+  if (errors) fprintf(stderr, "[demo] FAILED: %u Vulkan validation errors\n", errors);
+  return errors ? 1 : 0;
 }
