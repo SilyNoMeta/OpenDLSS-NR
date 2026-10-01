@@ -120,8 +120,9 @@ not guarantees for a clean driver cache. Resize preserves the model and kernels 
 | 1920x1080 | compat | 4962 | 141 | 141 | 4681 |
 | 1920x1080 | sm86 | 1094 | 141 | 146 | 808 |
 
-Values are rounded from Context's requested buffer sizes; independent rounding may differ by one MiB. Recorded
-peaks equal these resident totals. This excludes Vulkan allocation padding, driver/module memory, scene textures,
+Values are rounded from the buffer memory allocation sizes returned by Vulkan (`VkMemoryRequirements::size`);
+independent rounding may differ by one MiB. Recorded peaks equal these resident totals. This includes buffer
+allocation padding but excludes driver/module memory, scene textures,
 swapchain/history images and other desktop processes; it is not total system VRAM usage.
 
 Both `profile` commands complete. At 512x512, sums of per-dispatch spans were 632.10 ms compat and 17.29 ms sm86;

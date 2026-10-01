@@ -10,7 +10,8 @@ with cuModuleLoadData (the driver compiles the PTX for the GPU it runs on):
   saturation at 448 and NaN -> 0x7f;
 * mma: m16n8k32 E4M3 MMAs on random fragments, against the F13 group arithmetic of docs/numerics.md. The lowered
   MMA is not expected to be bit-exact (Ampere sums each group differently); the check is that it computes the same
-  products and groups: every result within a few F13 truncation units, and most of them equal.
+  products and groups: every result within the exponent-based local summation bound below. This is not a
+  full-network error bound.
 
 Needs NumPy and an NVIDIA GPU of compute capability 8.0 or later.
 """

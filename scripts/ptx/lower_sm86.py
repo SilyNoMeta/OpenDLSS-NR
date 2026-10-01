@@ -14,8 +14,8 @@ sm_80-compatible instructions:
 
   What is NOT preserved is the addition: Ada sums each group of 16 products as an F13 fixed-point dot product
   (docs/numerics.md); Ampere's f16 MMA sums them its own way. The lowered kernels are therefore a close
-  approximation of the native ones, not a bit-exact copy (docs/ampere: on random E4M3 data 74.6% of groups give
-  the same half, 95.4% within one ULP). The exact route on Ampere is the compatibility backend.
+  approximation of the native ones, not a bit-exact copy. The operand/accumulator probe and full-network
+  deviations are reported separately in docs/ampere/RESULTS.md. The exact route on Ampere is the compatibility backend.
 
 * cvt.rn.f16x2.e4m3x2 (decode two codes) -> the bit-level decode below; exact for every code but the NaN code
   0x7f / 0xff (decoded as 480 instead of NaN), which no activation or weight of the network holds (activations

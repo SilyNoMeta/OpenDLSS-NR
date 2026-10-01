@@ -84,8 +84,10 @@ the proxy directly, as `dlss5vk image` does (no temporal history).
 
 ## 6. History
 
-- Two history images alternate by frame parity; this does not itself limit the number of frames in flight. Descriptor pools and parameter buffers
-  follow the same parity (`vk::Context::resetDescriptorPool(slot)`).
+- Two history images alternate by frame parity. Frames using this graph must execute in order on one queue with
+  the pass's reuse barriers. Parameter buffers follow the same parity. The demo records secondary commands and
+  their descriptor sets once; their pools remain alive until GPU completion before a rebuild. A host must not
+  reset a descriptor pool while commands using its sets are pending (`vk::Context::resetDescriptorPool(slot)`).
 - Reset (`NrPass::resetHistory()`): on a camera cut, a scene change, a resize, NR or temporal toggled, and after a
   chained-wait timeout (section 8). After a reset the composite blends with weight 0 for that frame.
 - With NR off the composite keeps the history primed with the proxy, so turning NR back on does not flash.
@@ -105,7 +107,7 @@ the proxy directly, as `dlss5vk image` does (no temporal history).
   been measured.
 - Lifetimes: `vk::Context` > `nr::Model` > `nr::Kernels` > `nr::Graph`. A resize rebuilds the `Graph` (its
   activations) and the host's images; context, model (and its re-laid matrices), kernels and pipelines survive.
-  `vk::Context::memoryUse()` reports requested buffer bytes in use and peak, excluding images/driver allocations.
+  `vk::Context::memoryUse()` reports buffer memory allocation bytes in use and peak, excluding images/driver allocations.
 - Preparation vs recurring cost: model load, kernel creation, graph build and the first frame (pipeline and PTX
   compilation) happen once; `dlss5vk bench` prints them apart (RESULTS.md).
 

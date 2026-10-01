@@ -35,7 +35,7 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
       backend and the reason, and refuses to leave the native route on a GPU of compute capability >= 8.9
 - [x] native SPIR-V byte-identical to before (all 13 files compared after every shader change); the native
       backend loads no `*_compat` module and its device requirements are unchanged
-- [ ] native route on Ada/Blackwell: **to be confirmed on such hardware (none available here)**
+- [!] native numerical/performance non-regression on Ada/Hopper/Blackwell: **hardware unavailable here**
 
 ## 4. Compatibility route (reference on sm86)
 
@@ -50,7 +50,8 @@ CUDA 13.4 toolkit (only for side experiments; the fork does not need it).
 - [x] 12 fixtures bit-exact (6 images, 33x33 to 1279x721, styles 0-2, auto-mask on/off): 75 boundaries + head,
       head + composed image from the proxy; `verify`: every block-0 kernel equals the CPU reference
 - [x] `image` (bit-identical to the reference composition), `bench`, `profile`, `enhance_image.py`
-- Compat cost: 602 ms at 512x512, 1.29 s at 1000x562 (field 1024x640), 1.94 s at 1279x721 (field 1280x768)
+- Final controlled compat benchmark: 643.37-659.63 ms GPU at 512x512, 5051.93-5259.33 ms at 1920x1080.
+  These synthetic graph medians differ from the earlier image-tool observations; see RESULTS.md for scope.
 
 ## 5. Optimized sm86 route
 
