@@ -1,6 +1,7 @@
 #include "nr_model.h"
 
 #include <cassert>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 
@@ -82,8 +83,13 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
     if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
       throw std::runtime_error("stage size mismatch: " + loaded.id);
     if (verifyHashes) {
-      std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
-      if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
+      // a hex digest in either case: sha256Hex spells it upper case, most tools lower case
+      std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size()), expected = stage["sha256"].str();
+      auto upper = [](std::string text) {
+        for (char& c : text) c = (char)toupper((unsigned char)c);
+        return text;
+      };
+      if (digest != upper(expected)) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
     }
     stages_.push_back(std::move(loaded));
   }
