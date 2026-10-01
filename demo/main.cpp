@@ -423,10 +423,12 @@ int main(int argc, char** argv) {
   uint32_t frameIndex = 0;
   bool running = true;
   bool pendingResize = false;
+  bool invalidFrameSeen = false;
   int pendingScene = -1;   // a dropdown selection, loaded at the top of the next frame
 
   auto capture = [&](const std::string& name) {
     engine->flushAndWait();
+    if (nr->chainTimedOut()) fail("chained NR frame failed; refusing to save a partial output");
     std::string prefix = options.capturePrefix.empty() ? "capture" : options.capturePrefix;
     nr->saveOutput(prefix + "-" + name + ".ppm", false);
     nr->saveOutput(prefix + "-" + name + "-scene.ppm", true);
@@ -573,7 +575,10 @@ int main(int argc, char** argv) {
     previousClipFromRotated = clipFromRotated;
 
     // ---- the frame
-    if (nr->chainTimedOut()) { engine->flushAndWait(); nr->fallBackToBarriers(); historyReset = true; }
+    if (nr->chainTimedOut()) {
+      invalidFrameSeen = true;
+      engine->flushAndWait(); nr->fallBackToBarriers(); historyReset = true;
+    }
     if (historyReset) { nr->resetHistory(); historyReset = false; }
     NrPass::Frame nrFrame = nr->beginFrame(controls, &background[0][0]);
     auto cpuStart = std::chrono::high_resolution_clock::now();
@@ -719,6 +724,7 @@ int main(int argc, char** argv) {
 
   // ---- shutdown
   engine->flushAndWait();
+  invalidFrameSeen = invalidFrameSeen || nr->chainTimedOut();
   {
     const NrTimings& t = nr->timings();
     fprintf(stderr, "[demo] %u frames at %ux%u, last GPU timings (ms): scene %.3f preprocess %.3f network %.3f composite %.3f present+ui %.3f frame %.3f; %.1f fps\n",
@@ -746,5 +752,6 @@ int main(int argc, char** argv) {
   SDL_Quit();
   const uint32_t errors = VulkanDevice::validationErrors();
   if (errors) fprintf(stderr, "[demo] FAILED: %u Vulkan validation errors\n", errors);
-  return errors ? 1 : 0;
+  if (invalidFrameSeen) fprintf(stderr, "[demo] FAILED: at least one chained frame was invalid\n");
+  return (errors || invalidFrameSeen) ? 1 : 0;
 }

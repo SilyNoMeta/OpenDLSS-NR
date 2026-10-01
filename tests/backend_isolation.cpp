@@ -35,6 +35,10 @@ int main(int argc, char** argv) {
     ci.pNext = &enabled.features;
     ci.enabledExtensionCount = (uint32_t)enabled.extensions.size();
     ci.ppEnabledExtensionNames = enabled.extensions.data();
+    const float priority = 1;
+    VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    queue.queueFamilyIndex = optimized.queueFamily(); queue.queueCount = 1; queue.pQueuePriorities = &priority;
+    ci.queueCreateInfoCount = 1; ci.pQueueCreateInfos = &queue;
     vk::BorrowedDevice device;
     device.instance = optimized.instance(); device.physical = optimized.physical();
     device.device = optimized.device(); device.queueFamily = optimized.queueFamily();
@@ -52,6 +56,11 @@ int main(int argc, char** argv) {
     try { vk::Context missingExtension(device); }
     catch (const std::exception& e) { rejected = std::string(e.what()).find("VK_NV_cuda_kernel_launch") != std::string::npos; }
     require(rejected, "borrowed disabled CUDA extension accepted");
+    ci.enabledExtensionCount = (uint32_t)enabled.extensions.size();
+    device.queueIndex = 1; rejected = false;
+    try { vk::Context missingQueue(device); }
+    catch (const std::exception& e) { rejected = std::string(e.what()).find("borrowed queue") != std::string::npos; }
+    require(rejected, "borrowed queue not enabled at creation accepted");
     puts("PASS: backend isolation and supported-vs-enabled borrowed-device requirements");
     return 0;
   } catch (const std::exception& e) { fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }

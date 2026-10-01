@@ -986,9 +986,12 @@ bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
   static const int mode = getenv("DLSS5VK_ATTN_STREAM") ? atoi(getenv("DLSS5VK_ATTN_STREAM")) : -1;
   if (!ptxGlobalAttentionEnabled() || mode == 0) return false;
   if (mode < 0 && paddedTokens <= 256) return false;
-  const bool available = std::ifstream(ptxDirectory_ + "/global_attention_stream_e4m3.ptx").good() &&
-                                std::ifstream(ptxDirectory_ + "/global_normalize_e4m3.ptx").good();
-  return available;
+  if (!streamAvailableKnown_) {
+    streamAvailable_ = std::ifstream(ptxDirectory_ + "/global_attention_stream_e4m3.ptx").good() &&
+                       std::ifstream(ptxDirectory_ + "/global_normalize_e4m3.ptx").good();
+    streamAvailableKnown_ = true;
+  }
+  return streamAvailable_;
 }
 
 void Kernels::globalNormalizePtx(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,

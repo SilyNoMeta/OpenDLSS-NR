@@ -109,11 +109,9 @@ VulkanDevice::VulkanDevice() {
   }
   if (family == UINT32_MAX) throw std::runtime_error("no graphics + compute queue family with timestamps");
   const uint32_t queueCount = families[family].queueCount >= 2 ? 2 : 1;
-  const float priorities[2] = {1.0f, 1.0f};
-  VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-  queueInfo.queueFamilyIndex = family;
-  queueInfo.queueCount = queueCount;
-  queueInfo.pQueuePriorities = priorities;
+  queueInfo_.queueFamilyIndex = family;
+  queueInfo_.queueCount = queueCount;
+  queueInfo_.pQueuePriorities = queuePriorities_;
 
   // ---- features: the kernels' chain, plus every supported core / 1.1 feature (the renderer assumes what the
   // device supports is enabled)
@@ -134,11 +132,10 @@ VulkanDevice::VulkanDevice() {
   createInfo_ = VkDeviceCreateInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   createInfo_.pNext = &requirements.features;
   createInfo_.queueCreateInfoCount = 1;
-  createInfo_.pQueueCreateInfos = nullptr;   // kept for the NR side's check of what was enabled, not for creation
+  createInfo_.pQueueCreateInfos = &queueInfo_;
   createInfo_.enabledExtensionCount = (uint32_t)enabledExtensions_.size();
   createInfo_.ppEnabledExtensionNames = enabledExtensions_.data();
   VkDeviceCreateInfo deviceInfo = createInfo_;
-  deviceInfo.pQueueCreateInfos = &queueInfo;
   VkDevice device = VK_NULL_HANDLE;
   VK_CHECK(vkCreateDevice(physical, &deviceInfo, nullptr, &device));
   volkLoadDevice(device);

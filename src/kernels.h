@@ -276,6 +276,7 @@ class Kernels {
                       const vk::Buffer* const bindings[vk::kGenericBindings], const void* push, uint32_t pushBytes,
                       uint32_t count);
   bool nativeFp8_ = true, ptx_ = true, chainEnabled_ = true;
+  mutable bool streamAvailableKnown_ = false, streamAvailable_ = false;
   vk::Context& context_;
   std::map<std::string, VkShaderModule> modules_;
   std::map<std::string, vk::Pipeline> pipelines_;

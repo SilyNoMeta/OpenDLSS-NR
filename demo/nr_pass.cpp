@@ -40,7 +40,7 @@ NrPass::NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const s
   borrowed.createInfo = static_cast<const VkDeviceCreateInfo*>(device.createInfo);
   context_ = std::make_unique<vk::Context>(borrowed);
   fprintf(stderr, "[nr] context adopted (%s, queue %u.%u)\n", context_->deviceName().c_str(), device.queueFamily, device.nrQueueIndex);
-  model_ = std::make_unique<nr::Model>(*context_, modelDir, false);
+  model_ = std::make_unique<nr::Model>(*context_, modelDir, true);
   fprintf(stderr, "[nr] model loaded\n");
   kernels_ = std::make_unique<nr::Kernels>(*context_, kernelDir);
   fprintf(stderr, "[nr] kernels loaded\n");

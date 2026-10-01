@@ -332,6 +332,9 @@ DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& e
   // route is a driver problem, not a reason to run the slow route: refuse unless the fallback was asked for.
   if (!requested && best.backend != Backend::Native) {
     const std::optional<ComputeCapability> capability = computeCapability(best.physical);
+    if (!capability)
+      throw std::runtime_error("native route unavailable and GPU compute capability unknown; refusing an automatic downgrade. "
+                               "Check the NVIDIA driver, or explicitly select DLSS5VK_BACKEND=compat.");
     if (capability && capability->atLeast(8, 9))
       throw std::runtime_error("this GPU (compute capability " + capability->text() +
                                ") has FP8 tensor cores but its driver does not expose the native route:" +
@@ -466,6 +469,27 @@ Context::Context(const BorrowedDevice& borrowed) {
   queueFamily_ = borrowed.queueFamily; queueIndex_ = borrowed.queueIndex; backend_ = borrowed.backend; owned_ = false;
   volkLoadInstance(instance_);
   volkLoadDevice(device_);
+  bool createdQueue = false;
+  const auto& ci = *borrowed.createInfo;
+  if (ci.pQueueCreateInfos) {
+    for (uint32_t i = 0; i < ci.queueCreateInfoCount; ++i) {
+      const auto& q = ci.pQueueCreateInfos[i];
+      createdQueue = createdQueue || (q.queueFamilyIndex == queueFamily_ && queueIndex_ < q.queueCount && q.flags == 0);
+    }
+  }
+  if (!createdQueue) throw std::runtime_error("the borrowed queue was not created as an unprotected device queue");
+  uint32_t familyCount = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_, &familyCount, nullptr);
+  std::vector<VkQueueFamilyProperties> families(familyCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_, &familyCount, families.data());
+  if (queueFamily_ >= familyCount || !(families[queueFamily_].queueFlags & VK_QUEUE_COMPUTE_BIT) ||
+      !families[queueFamily_].timestampValidBits)
+    throw std::runtime_error("the borrowed queue needs compute and timestamps");
+  if (backend_ == Backend::Sm86) {
+    const auto capability = computeCapability(physical_);
+    if (!capability || !capability->atLeast(8, 0) || capability->atLeast(8, 9))
+      throw std::runtime_error("the borrowed sm86 backend needs a verified Ampere compute capability");
+  }
   // The backend follows what the device was created with, not what the GPU could do: a renderer that did not
   // enable an extension or feature cannot have the kernels use it.
   const DeviceRequirements wanted(backend_);
@@ -486,7 +510,11 @@ Context::Context(const BorrowedDevice& borrowed) {
   }
   const VkBaseInStructure* executable =
       findInChain(borrowed.createInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
-  executableProperties_ = executable && reinterpret_cast<const VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR*>(executable)->pipelineExecutableInfo;
+  bool executableExtension = false;
+  for (uint32_t i = 0; i < ci.enabledExtensionCount; ++i)
+    executableExtension = executableExtension || !strcmp(ci.ppEnabledExtensionNames[i], VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+  executableProperties_ = executableExtension && executable &&
+      reinterpret_cast<const VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR*>(executable)->pipelineExecutableInfo;
   readDeviceProperties();
   fprintf(stderr, "backend: %s - %s (borrowed device)\n", backendName(backend_), backendDescription(backend_));
   initCommon();

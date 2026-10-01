@@ -26,5 +26,7 @@ class VulkanDevice {
   std::unique_ptr<vk::DeviceRequirements> requirements_;
   std::vector<const char*> enabledExtensions_;
   VkDeviceCreateInfo createInfo_{};
+  VkDeviceQueueCreateInfo queueInfo_{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+  float queuePriorities_[2] = {1.0f, 1.0f};
   uint64_t messenger_ = 0;   // VkDebugUtilsMessengerEXT, with DLSS5_DEMO_VALIDATION=1
 };
