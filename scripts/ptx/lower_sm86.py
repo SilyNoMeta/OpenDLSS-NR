@@ -1,4 +1,4 @@
-"""Lower the generated E4M3 PTX kernels to Ampere (sm_86): no FP8 instruction is left.
+"""Lower the generated E4M3 PTX kernels to Ampere (sm_80 and up, validated on sm_86): no FP8 instruction is left.
 
   python scripts/ptx/lower_sm86.py <input .ptx | directory> <output .ptx | directory> [--accumulate=f16|f32]
 
@@ -24,7 +24,9 @@ sm_80-compatible instructions:
 * cvt.rn.satfinite.e4m3x2.f16x2 (encode two halves) -> integer round-to-nearest-even with finite saturation at
   448 (code 0x7e) and NaN -> 0x7f, the instruction's own semantics, for every half input.
 
-`.target sm_89` becomes `.target sm_86`. Nothing else changes: register caps, shared memory and launch shapes are
+`.target sm_89` becomes `.target sm_80`: nothing left needs more than Ampere's first generation (f16 mma.sync,
+cp.async, ldmatrix), so the driver can compile the kernels for any compute capability 8.x; they are validated on
+sm_86 only. Nothing else changes: register caps, shared memory and launch shapes are
 the Ada generators' choices, which an Ampere-tuned generator may later revisit.
 """
 from __future__ import annotations
@@ -187,7 +189,7 @@ def lower(text: str) -> tuple[str, dict[str, int]]:
                 break
         else:
             if re.match(r"^\s*\.target\s+sm_89\s*$", line):
-                line = line.replace("sm_89", "sm_86")
+                line = line.replace("sm_89", "sm_80")
             out.append(line)
     lowered = "\n".join(out) + "\n"
     leftover = re.findall(r"\be4m3\w*|\.target\s+sm_89", re.sub(r"//.*", "", lowered))
@@ -215,7 +217,7 @@ def main() -> None:
         (target / path.name if source.is_dir() else target).write_text(lowered, encoding="utf-8", newline="\n")
         for key in totals:
             totals[key] += counts[key]
-    print(f"lowered {len(files)} kernel(s) to sm_86 ({ACCUMULATE} accumulation): {totals['mma']} E4M3 MMAs, {totals['decode']} decodes, "
+    print(f"lowered {len(files)} kernel(s) for sm_80+ ({ACCUMULATE} accumulation): {totals['mma']} E4M3 MMAs, {totals['decode']} decodes, "
           f"{totals['encode']} encodes")
 
 
