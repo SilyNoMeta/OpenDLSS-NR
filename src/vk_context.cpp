@@ -86,18 +86,13 @@ const FeatureField kFeatureFields[] = {
     NR_FEATURE(VkPhysicalDeviceVulkan13Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, synchronization2),
     NR_FEATURE(VkPhysicalDeviceVulkan13Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, maintenance4),
     NR_FEATURE(VkPhysicalDeviceCooperativeMatrixFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, cooperativeMatrix),
-    NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixWorkgroupScope),
     NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixFlexibleDimensions),
-    NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixReductions),
     NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixConversions),
     NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixPerElementOperations),
     NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixTensorAddressing),
-    NR_FEATURE(VkPhysicalDeviceCooperativeMatrix2FeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV, cooperativeMatrixBlockLoads),
     NR_FEATURE(VkPhysicalDeviceShaderFloat8FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT, shaderFloat8),
     NR_FEATURE(VkPhysicalDeviceShaderFloat8FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT, shaderFloat8CooperativeMatrix),
     NR_FEATURE(VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, pipelineExecutableInfo),
-    NR_FEATURE(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR, shaderSubgroupClock),
-    NR_FEATURE(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR, shaderDeviceClock),
     NR_FEATURE(VkPhysicalDeviceShaderSMBuiltinsFeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV, shaderSMBuiltins),
     NR_FEATURE(VkPhysicalDeviceCudaKernelLaunchFeaturesNV, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV, cudaKernelLaunchFeatures),
 };
@@ -217,37 +212,52 @@ DeviceRequirements::DeviceRequirements(Backend backend, bool enable) : backend(b
   link(sm);
   extensions = {VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME};
   if (backend == Backend::Native) {
+    // PTX launches: the extension's feature bit is part of the contract, as on sm86 (a device created without it
+    // names the extension but may not launch).
+    cuda.cudaKernelLaunchFeatures = on;
+    link(cuda);
     coop.cooperativeMatrix = on;
     link(coop);
-    coop2.cooperativeMatrixWorkgroupScope = on;
+    // What the native SPIR-V declares, and nothing else of the extension.
     coop2.cooperativeMatrixFlexibleDimensions = on;
-    coop2.cooperativeMatrixReductions = on;
     coop2.cooperativeMatrixConversions = on;
     coop2.cooperativeMatrixPerElementOperations = on;
     coop2.cooperativeMatrixTensorAddressing = on;
-    coop2.cooperativeMatrixBlockLoads = on;
     link(coop2);
     fp8.shaderFloat8 = on;
     fp8.shaderFloat8CooperativeMatrix = on;
     link(fp8);
-    executable.pipelineExecutableInfo = on;
-    link(executable);
-    clock.shaderSubgroupClock = on;
-    clock.shaderDeviceClock = on;
-    link(clock);
     extensions.insert(extensions.end(),
                       {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-                       VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME,
-                       VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_SHADER_CLOCK_EXTENSION_NAME});
+                       VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME, VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME});
   } else if (backend == Backend::Sm86) {
-    // The compatibility GLSL plus PTX launches; the feature bit is enabled explicitly (the native chain predates it).
+    // The compatibility GLSL plus PTX launches.
     cuda.cudaKernelLaunchFeatures = on;
     link(cuda);
-    executable.pipelineExecutableInfo = on;
-    link(executable);
-    extensions.insert(extensions.end(),
-                      {VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME});
+    extensions.insert(extensions.end(), {VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME});
   }
+}
+
+void DeviceRequirements::enableStatistics() {
+  if (executable.pipelineExecutableInfo) return;
+  executable.pipelineExecutableInfo = VK_TRUE;
+  executable.pNext = features.pNext;
+  features.pNext = &executable;
+  extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+}
+
+bool DeviceRequirements::statisticsSupported(VkPhysicalDevice physical) {
+  const std::vector<VkExtensionProperties> available = deviceExtensions(physical);
+  if (!std::any_of(available.begin(), available.end(), [](const VkExtensionProperties& e) {
+        return !strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+      }))
+    return false;
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR query{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+  VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  supported.pNext = &query;
+  vkGetPhysicalDeviceFeatures2(physical, &supported);
+  return query.pipelineExecutableInfo == VK_TRUE;
 }
 
 DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& extraExtensions) {
@@ -448,6 +458,7 @@ Context::Context() {
   queueInfo.pQueuePriorities = &priority;
 
   DeviceRequirements req(backend_);
+  if (DeviceRequirements::statisticsSupported(physical_)) req.enableStatistics();   // diagnostics only
   VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   deviceInfo.pNext = &req.features;
   deviceInfo.queueCreateInfoCount = 1;
@@ -469,6 +480,11 @@ Context::Context(const BorrowedDevice& borrowed) {
   queueFamily_ = borrowed.queueFamily; queueIndex_ = borrowed.queueIndex; backend_ = borrowed.backend; owned_ = false;
   volkLoadInstance(instance_);
   volkLoadDevice(device_);
+  // A PTX backend records launches: the device must dispatch the extension, not merely name it.
+  if (ptxKernels() && (!vkCreateCudaModuleNV || !vkCreateCudaFunctionNV || !vkDestroyCudaModuleNV ||
+                       !vkDestroyCudaFunctionNV || !vkCmdCudaLaunchKernelNV))
+    throw std::runtime_error(std::string("the borrowed device does not dispatch VK_NV_cuda_kernel_launch, which the ") +
+                             backendName(backend_) + " backend launches its PTX kernels through");
   bool createdQueue = false;
   const auto& ci = *borrowed.createInfo;
   if (ci.pQueueCreateInfos) {

@@ -71,6 +71,10 @@ std::optional<Backend> requestedBackend();          // DLSS5VK_BACKEND, empty fo
 // The device features / extensions a backend needs, as a stable pNext chain (the demo hands it to the renderer's
 // device creation; Context::Context() uses it for its own device). With enable = false the chain is the same with
 // nothing set, ready for vkGetPhysicalDeviceFeatures2. Not copyable: the chain points into the object.
+// Only what the kernels use is required: the native SPIR-V declares subgroup-scope matrices of flexible dimensions,
+// conversions, per-element operations and tensor addressing (no workgroup scope, reductions or block loads), and
+// both PTX backends launch through VK_NV_cuda_kernel_launch, whose feature bit they enable. Diagnostics are never
+// a requirement: enableStatistics() adds VK_KHR_pipeline_executable_properties where the device has it.
 struct DeviceRequirements {
   Backend backend;
   VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -79,8 +83,7 @@ struct DeviceRequirements {
   VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
   VkPhysicalDeviceCooperativeMatrix2FeaturesNV coop2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
   VkPhysicalDeviceShaderFloat8FeaturesEXT fp8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
-  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-  VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};   // optional: enableStatistics()
   VkPhysicalDeviceShaderSMBuiltinsFeaturesNV sm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV};
   VkPhysicalDeviceCudaKernelLaunchFeaturesNV cuda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV};
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -89,6 +92,10 @@ struct DeviceRequirements {
   DeviceRequirements(const DeviceRequirements&) = delete;
   DeviceRequirements& operator=(const DeviceRequirements&) = delete;
   void* pNextChain() { return features.pNext; }   // for a VkDeviceCreateInfo that carries VkPhysicalDeviceFeatures itself
+  // Optional pipeline statistics (`dlss5vk stats`): links the feature and adds the extension. Only for a device
+  // that supports both (statisticsSupported); no kernel depends on it.
+  void enableStatistics();
+  static bool statisticsSupported(VkPhysicalDevice physical);
 };
 
 // The physical device and backend for the NR kernels. Each device is checked against every candidate backend's

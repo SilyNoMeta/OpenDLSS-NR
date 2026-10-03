@@ -26,9 +26,12 @@ need).
 * **PTX.** `VK_NV_cuda_kernel_launch`: the generated `.ptx` text becomes a `VkCudaModuleNV`, the driver JITs
   it, and launches go into the same command buffer as the dispatches.
 
-Extensions required: `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8`,
-`VK_NV_cuda_kernel_launch`, plus `VK_KHR_pipeline_executable_properties`, `VK_KHR_shader_clock` and
-`VK_NV_shader_sm_builtins` for tooling.
+Extensions required: `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8` and
+`VK_NV_cuda_kernel_launch` (with its `cudaKernelLaunchFeatures` bit, on `native` as on `sm86`), plus
+`VK_NV_shader_sm_builtins`. Of `VK_NV_cooperative_matrix2` only what the SPIR-V declares is enabled: flexible
+dimensions, conversions, per-element operations and tensor addressing; no workgroup scope, reductions or block
+loads. `VK_KHR_pipeline_executable_properties` is tooling (`dlss5vk stats`): the tool's own device enables it
+when the driver has it, and a borrowed device is never required to.
 
 ## Activations
 
