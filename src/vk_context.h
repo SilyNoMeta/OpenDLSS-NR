@@ -103,9 +103,20 @@ struct BorrowedDevice {
   const VkDeviceCreateInfo* createInfo = nullptr;   // only read during the constructor
 };
 
+// A device of the Context's own for a host that renders with another API (a Direct3D bridge). The GPU is the host's,
+// named by its adapter LUID and never chosen by score; the backend is the one asked for, or an error that says what
+// the device lacks; and the device is created with the extensions and features the sharing needs.
+struct DedicatedDevice {
+  uint64_t luid = 0;
+  Backend backend = Backend::Native;
+  std::vector<const char*> extensions;   // on top of the backend's (external memory, external semaphores...)
+  bool timelineSemaphore = false;
+};
+
 class Context : public exec::Device {
  public:
   Context();   // its own instance and device, on selectDevice's choice
+  explicit Context(const DedicatedDevice& dedicated);   // its own instance and device, on the GPU with that LUID
   // Adopt a device created elsewhere; the instance / device are not destroyed by this object.
   explicit Context(const BorrowedDevice& borrowed);
   ~Context() override;
@@ -124,6 +135,7 @@ class Context : public exec::Device {
 
   uint32_t smCount() const override { return smCount_; }
   VkQueue queue() const { return queue_; }
+  VkCommandPool commandPool() const { return commandPool_; }   // the pool beginCommands allocates from
   VkPhysicalDevice physical() const { return physical_; }
   float timestampPeriodNs() const { return timestampPeriod_; }
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
@@ -222,6 +234,7 @@ class Context : public exec::Device {
   MemoryUse memoryUse_;
   bool owned_ = true;
   std::string deviceName_;
+  void createOwned(const DedicatedDevice* dedicated);
   void readDeviceProperties();   // SMs, subgroup, limits, memory types
   void initCommon();   // command pool, layouts, pools, staging
   Buffer dummy_;

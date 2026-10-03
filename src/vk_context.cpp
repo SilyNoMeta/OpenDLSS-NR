@@ -339,7 +339,50 @@ DeviceChoice selectDevice(VkInstance instance, const std::vector<const char*>& e
   return best;
 }
 
-Context::Context() {
+namespace {
+// The physical device with `luid`, for `backend` plus `extensions`; throws naming what it lacks. No other device is
+// ever taken in its place.
+DeviceChoice selectByLuid(VkInstance instance, uint64_t luid, Backend backend, const std::vector<const char*>& extensions) {
+  uint32_t count = 0;
+  VK_CHECK(vkEnumeratePhysicalDevices(instance, &count, nullptr));
+  std::vector<VkPhysicalDevice> devices(count);
+  VK_CHECK(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
+  for (VkPhysicalDevice device : devices) {
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &id;
+    vkGetPhysicalDeviceProperties2(device, &properties);
+    uint64_t deviceLuid = 0;
+    memcpy(&deviceLuid, id.deviceLUID, sizeof(deviceLuid));
+    if (!id.deviceLUIDValid || deviceLuid != luid) continue;
+    const std::vector<std::string> missing = missingRequirements(device, backend, extensions);
+    if (!missing.empty()) {
+      std::string list;
+      for (const std::string& m : missing) list += " " + m;
+      throw std::runtime_error(std::string("the GPU of the host device cannot run the ") + backendName(backend) + " backend over a bridge: missing" + list);
+    }
+    if (backend == Backend::Sm86) {
+      const std::optional<ComputeCapability> capability = computeCapability(device);
+      if (!capability || !capability->atLeast(8, 0) || capability->atLeast(8, 9))
+        throw std::runtime_error("the sm86 backend needs an Ampere GPU (compute capability 8.0 to 8.7); this one is " +
+                                 (capability ? capability->text() : std::string("of unknown compute capability")));
+    }
+    DeviceChoice choice;
+    choice.physical = device;
+    choice.backend = backend;
+    choice.reason = "dedicated device on the host's GPU";
+    return choice;
+  }
+  char text[96];
+  snprintf(text, sizeof(text), "no Vulkan physical device has the host adapter's LUID %016llX", (unsigned long long)luid);
+  throw std::runtime_error(text);
+}
+}  // namespace
+
+Context::Context() { createOwned(nullptr); }
+Context::Context(const DedicatedDevice& dedicated) { createOwned(&dedicated); }
+
+void Context::createOwned(const DedicatedDevice* dedicated) {
   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("the Vulkan loader is unavailable");
 
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -377,7 +420,8 @@ Context::Context() {
     VK_CHECK(vkCreateDebugUtilsMessengerEXT(instance_, &messengerInfo, nullptr, &messenger_));
   }
 
-  const DeviceChoice choice = selectDevice(instance_);
+  const DeviceChoice choice = dedicated ? selectByLuid(instance_, dedicated->luid, dedicated->backend, dedicated->extensions)
+                                        : selectDevice(instance_);
   physical_ = choice.physical;
   backend_ = choice.backend;
   if (getenv("DLSS5VK_LIST_EXTENSIONS")) {
@@ -440,6 +484,17 @@ Context::Context() {
 
   DeviceRequirements req(backend_);
   if (DeviceRequirements::statisticsSupported(physical_)) req.enableStatistics();   // diagnostics only
+  if (dedicated) {
+    req.extensions.insert(req.extensions.end(), dedicated->extensions.begin(), dedicated->extensions.end());
+    if (dedicated->timelineSemaphore) {
+      VkPhysicalDeviceVulkan12Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+      VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      query.pNext = &supported;
+      vkGetPhysicalDeviceFeatures2(physical_, &query);
+      if (!supported.timelineSemaphore) throw std::runtime_error("the bridge needs timeline semaphores, which this device does not have");
+      req.f12.timelineSemaphore = VK_TRUE;
+    }
+  }
   VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   deviceInfo.pNext = &req.features;
   deviceInfo.queueCreateInfoCount = 1;

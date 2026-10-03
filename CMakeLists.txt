@@ -32,6 +32,10 @@ endif()
 add_library(dlss5vk_volk STATIC "${VOLK_DIR}/volk.c")
 target_include_directories(dlss5vk_volk PUBLIC "${VULKAN_HEADERS_DIR}" "${VOLK_DIR}")
 target_compile_definitions(dlss5vk_volk PUBLIC VK_NO_PROTOTYPES VK_ENABLE_BETA_EXTENSIONS)
+if(WIN32)
+    # The Direct3D bridge imports Direct3D textures and fences (VK_KHR_external_memory_win32 / _semaphore_win32).
+    target_compile_definitions(dlss5vk_volk PUBLIC VK_USE_PLATFORM_WIN32_KHR)
+endif()
 if(UNIX AND NOT APPLE)
     target_link_libraries(dlss5vk_volk PUBLIC dl)
 endif()
@@ -39,7 +43,8 @@ endif()
 # The Direct3D 12 / 11 adapters (NVIDIA's CUDA interop through the driver's nvapi64.dll, resolved at run time).
 set(DLSS5VK_D3D_SOURCES "")
 if(WIN32)
-    set(DLSS5VK_D3D_SOURCES src/d3d/d3d_common.cpp src/d3d/d3d12_device.cpp src/d3d/d3d11_device.cpp)
+    set(DLSS5VK_D3D_SOURCES src/d3d/d3d_common.cpp src/d3d/d3d12_device.cpp src/d3d/d3d11_device.cpp
+        src/bridge/d3d_vulkan_bridge.cpp src/bridge/bridge_tool.cpp)
 endif()
 
 add_executable(dlss5vk

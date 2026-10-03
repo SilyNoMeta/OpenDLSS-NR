@@ -25,6 +25,9 @@
 #include "numeric.h"
 #include "reference.h"
 #include "device_factory.h"
+#ifdef _WIN32
+#include "bridge/bridge_tool.h"
+#endif
 #include "exec_tape.h"
 #include "vk_context.h"
 
@@ -1009,6 +1012,53 @@ int runProfile(int argc, char** argv) {
 }
 }  // namespace
 
+#ifdef _WIN32
+// dlss5vk bridge: see src/bridge/bridge_tool.h.
+int runBridge(int argc, char** argv) {
+  bridge::ToolInput input;
+  input.host = argValue(argc, argv, "--host");
+  input.modelDir = argValue(argc, argv, "--model");
+  input.shaderDir = argValue(argc, argv, "--shaders", executableDirectory(argv[0]) + "/shaders");
+  input.dumpDir = argValue(argc, argv, "--dump");
+  input.jsonPath = argValue(argc, argv, "--json");
+  input.transportOnly = hasFlag(argc, argv, "--transport");
+  input.sameKernels = hasFlag(argc, argv, "--same-kernels");
+  input.frames = std::max(2, atoi(argValue(argc, argv, "--frames", "10").c_str()));
+  const char* validation = getenv("DLSS5VK_VALIDATION");
+  input.debugLayer = validation && *validation && strcmp(validation, "0");
+  const std::string fixtureDir = argValue(argc, argv, "--fixture");
+  if (input.host.empty() || (!input.transportOnly && (input.modelDir.empty() || fixtureDir.empty()))) {
+    fprintf(stderr, "usage: dlss5vk bridge --host d3d12|d3d11 --model <dir> --fixture <proxy fixture> [--frames N] [--same-kernels] [--dump <dir>] [--json <file>]\n"
+                    "       dlss5vk bridge --host d3d12|d3d11 --transport [--width W --height H] [--frames N] [--json <file>]\n");
+    return 2;
+  }
+  if (input.transportOnly) {
+    input.proxyWidth = (uint32_t)atoi(argValue(argc, argv, "--width", "512").c_str());
+    input.proxyHeight = (uint32_t)atoi(argValue(argc, argv, "--height", "512").c_str());
+    if (!input.proxyWidth || !input.proxyHeight) throw std::runtime_error("--width and --height must be positive");
+  } else {
+    json::Value manifest = json::parse(readText(fixtureDir + "/manifest.json"));
+    const FixturePlan plan = planFixture(manifest, fixtureDir);
+    if (plan.proxyFile.empty()) throw std::runtime_error("the bridge needs a proxy fixture (the host writes the proxy image)");
+    input.validWidth = plan.validWidth; input.validHeight = plan.validHeight;
+    input.fullWidth = plan.fullWidth; input.fullHeight = plan.fullHeight;
+    input.proxyWidth = plan.proxyWidth; input.proxyHeight = plan.proxyHeight;
+    input.proxy = readFile(plan.proxyFile);
+    const json::Value& conditioning = manifest["conditioning"];
+    input.seed = (uint32_t)manifest["seed"].integer();
+    input.autoMask = manifest["autoMask"].boolean;
+    input.localTone = (float)conditioning["localTone"].number;
+    input.localStructure = (float)conditioning["localStructure"].number;
+    input.skinStructure = (float)conditioning["skinStructure"].number;
+    input.style = (float)conditioning["style"].number;
+    if (plan.checkHead) input.referenceHead = readFile(plan.headFile);
+  }
+  const bridge::ToolResult result = bridge::runTool(input);
+  printf("\nVERDICT: %s\n", result.passed ? "PASS" : "FAIL");
+  return result.passed ? 0 : 1;
+}
+#endif
+
 int runCommand(int argc, char** argv) {
   if (argc >= 2 && !strcmp(argv[1], "verify")) return runVerify(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "shaderinfo")) return runShaderInfo(argc, argv);
@@ -1016,6 +1066,9 @@ int runCommand(int argc, char** argv) {
   if (argc >= 2 && !strcmp(argv[1], "parity")) return runParity(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "image")) return runImage(argc, argv);
   if (argc >= 2 && !strcmp(argv[1], "bench")) return runBench(argc, argv);
+#ifdef _WIN32
+  if (argc >= 2 && !strcmp(argv[1], "bridge")) return runBridge(argc, argv);
+#endif
   fprintf(stderr, "usage: dlss5vk parity|verify|image|bench|profile|shaderinfo --model <dir> ...\n");
   return 2;
 }
