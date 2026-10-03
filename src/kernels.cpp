@@ -177,7 +177,10 @@ void Kernels::checkChainOrder() const {
 exec::Address Kernels::chainStatusAddress() {
   if (chainStatus_.buffer == nullptr) {
     chainStatus_ = context_.createBuffer(16, true, "chain status");
-    memset(chainStatus_.mapped, 0, 16);
+    // Not mapped where chaining is unsupported: the kernels still take its address, and never write it there
+    // (only a chained wait that times out does).
+    if (chainStatus_.mapped) memset(chainStatus_.mapped, 0, 16);
+    else context_.fillZero(chainStatus_);
   }
   return context_.deviceAddress(chainStatus_);
 }

@@ -128,7 +128,7 @@ class Context : public exec::Device {
   float timestampPeriodNs() const { return timestampPeriod_; }
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
-  const std::string& deviceName() const { return deviceName_; }
+  const std::string& deviceName() const override { return deviceName_; }
   Backend backend() const override { return backend_; }
   bool nativeFp8() const override { return backend_ == Backend::Native; }   // FP8 cooperative matrices and conversions in GLSL
   uint32_t subgroupSize() const { return subgroupSize_; }
@@ -162,8 +162,9 @@ class Context : public exec::Device {
   void resetDescriptorPool(uint32_t slot); // reset and use a specific pool (the caller's frame-in-flight slot)
 
   // Commands --------------------------------------------------------------------
-  VkCommandBuffer beginCommands();
-  void endAndSubmit(VkCommandBuffer commands, bool wait = true);
+  exec::Commands beginCommands() override;   // a VkCommandBuffer
+  void endAndSubmit(exec::Commands commands, bool wait = true) override;
+  void nextFrame() override { resetDescriptorPool(); }
   void waitIdle() { VK_CHECK(vkQueueWaitIdle(queue_)); }
   void computeBarrier(exec::Commands commands) override;   // compute -> compute
   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
@@ -188,8 +189,7 @@ class Context : public exec::Device {
   uint32_t maxComputeSharedMemory() const { return maxSharedMemory_; }
 
   // Memory accounting of every buffer this Context created (device-local and host-visible apart), current and peak.
-  struct MemoryUse { VkDeviceSize deviceLocal = 0, hostVisible = 0, peakDeviceLocal = 0; };
-  const MemoryUse& memoryUse() const { return memoryUse_; }
+  MemoryUse memoryUse() const override { return memoryUse_; }
 
  private:
   uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required);

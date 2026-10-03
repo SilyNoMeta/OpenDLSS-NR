@@ -646,7 +646,7 @@ void Context::upload(const Buffer& target, const void* data, exec::Size size, ex
   while (done < size) {
     VkDeviceSize chunk = std::min(size - done, staging_.size);
     memcpy(staging_.mapped, bytes + done, chunk);
-    VkCommandBuffer commands = beginCommands();
+    VkCommandBuffer commands = handle(beginCommands());
     VkBufferCopy region{0, offset + done, chunk};
     vkCmdCopyBuffer(commands, handle(staging_), handle(target), 1, &region);
     endAndSubmit(commands, true);
@@ -655,7 +655,7 @@ void Context::upload(const Buffer& target, const void* data, exec::Size size, ex
 }
 
 void Context::fillZero(const Buffer& target) {
-  VkCommandBuffer commands = beginCommands();
+  VkCommandBuffer commands = handle(beginCommands());
   vkCmdFillBuffer(commands, handle(target), 0, VK_WHOLE_SIZE, 0);
   endAndSubmit(commands, true);
 }
@@ -666,7 +666,7 @@ std::vector<uint8_t> Context::download(const Buffer& source, exec::Size size, ex
   VkDeviceSize done = 0;
   while (done < size) {
     VkDeviceSize chunk = std::min(size - done, staging_.size);
-    VkCommandBuffer commands = beginCommands();
+    VkCommandBuffer commands = handle(beginCommands());
     VkBufferCopy region{offset + done, 0, chunk};
     vkCmdCopyBuffer(commands, handle(source), handle(staging_), 1, &region);
     endAndSubmit(commands, true);
@@ -816,7 +816,7 @@ void Context::resetDescriptorPool(uint32_t slot) {
   VK_CHECK(vkResetDescriptorPool(device_, descriptorPool_, 0));
 }
 
-VkCommandBuffer Context::beginCommands() {
+exec::Commands Context::beginCommands() {
   VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   allocateInfo.commandPool = commandPool_;
   allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -829,7 +829,8 @@ VkCommandBuffer Context::beginCommands() {
   return commands;
 }
 
-void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
+void Context::endAndSubmit(exec::Commands stream, bool wait) {
+  VkCommandBuffer commands = handle(stream);
   VK_CHECK(vkEndCommandBuffer(commands));
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;

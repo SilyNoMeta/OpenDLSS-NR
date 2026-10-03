@@ -24,6 +24,7 @@
 #include "nr_model.h"
 #include "numeric.h"
 #include "reference.h"
+#include "device_factory.h"
 #include "vk_context.h"
 
 #if defined(_WIN32)
@@ -377,7 +378,7 @@ struct GraphRun {
   bool chained = false, repeatable = true;
 };
 
-GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, const nr::Geometry& geometry,
+GraphRun runGraph(exec::Device& context, nr::Model& model, nr::Kernels& kernels, const nr::Geometry& geometry,
                   const nr::Activation& features, bool chain, bool capture, int submissions) {
   const bool chainBefore = kernels.chainEnabled();
   kernels.setChainEnabled(chainBefore && chain);
@@ -393,8 +394,8 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
     run.chained = graph.chained();
     exec::Timer queries = context.createTimestampPool(2);
     for (int submission = 0; submission < submissions; ++submission) {
-      context.resetDescriptorPool();
-      VkCommandBuffer commands = context.beginCommands();
+      context.nextFrame();
+      exec::Commands commands = context.beginCommands();
       context.resetTimestamps(commands, queries, 2);
       context.writeTimestamp(commands, queries, 0, true);
       graph.record(commands, features);
@@ -429,8 +430,9 @@ int runParity(int argc, char** argv) {
   json::Value manifest = json::parse(readText(fixtureDir + "/manifest.json"));
   const FixturePlan plan = planFixture(manifest, fixtureDir);
 
-  vk::Context context;
-  printf("device: %s\n", context.deviceName().c_str());
+  const std::unique_ptr<exec::Device> owned = makeDevice();
+  exec::Device& context = *owned;
+  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
   auto started = std::chrono::steady_clock::now();
   nr::Model model(context, modelDir, !hasFlag(argc, argv, "--no-verify"));
   printf("model loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
@@ -471,7 +473,7 @@ int runParity(int argc, char** argv) {
                                            manifest["autoMask"].boolean, (float)conditioning["localTone"].number,
                                            (float)conditioning["localStructure"].number, (float)conditioning["skinStructure"].number,
                                            (float)conditioning["style"].number};
-    VkCommandBuffer commands = context.beginCommands();
+    exec::Commands commands = context.beginCommands();
     kernels.preprocessFromProxy(commands, proxyBuffer, features, preprocess);
     context.endAndSubmit(commands, true);
   } else {
@@ -598,8 +600,10 @@ int runBench(int argc, char** argv) {
   auto seconds = [](Clock::time_point from) { return std::chrono::duration<double>(Clock::now() - from).count(); };
   auto mib = [](VkDeviceSize bytes) { return bytes / 1048576.0; };
   auto started = Clock::now();
-  vk::Context context;
-  printf("device: %s\n", context.deviceName().c_str());
+  const std::unique_ptr<exec::Device> owned = makeDevice();
+  exec::Device& context = *owned;
+  vk::Context* const vulkan = dynamic_cast<vk::Context*>(owned.get());
+  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
   const double contextSeconds = seconds(started);
   started = Clock::now();
   nr::Model model(context, modelDir, false);
@@ -628,7 +632,7 @@ int runBench(int argc, char** argv) {
   // Warm compile. A chained wait that timed out here (a GPU that schedules the launches differently) rebuilds the
   // graph with barriers, as the demo does, instead of failing the run; later frames still fail on one.
   {
-    VkCommandBuffer commands = context.beginCommands();
+    exec::Commands commands = context.beginCommands();
     graph->record(commands, *features);
     context.endAndSubmit(commands, true);
     const nr::Kernels::ChainTimeouts timeouts = kernels.chainTimeouts();
@@ -638,7 +642,7 @@ int runBench(int argc, char** argv) {
       kernels.setChainEnabled(false);
       kernels.resetChainTimeouts();
       build();
-      context.resetDescriptorPool();
+      context.nextFrame();
       commands = context.beginCommands();
       graph->record(commands, *features);
       context.endAndSubmit(commands, true);
@@ -648,7 +652,7 @@ int runBench(int argc, char** argv) {
   const double firstFrameSeconds = seconds(started);
   printf("preparation: device %.2f s, model %.2f s, kernels %.2f s, graph %.2f s, first frame (compiles) %.2f s\n",
          contextSeconds, modelSeconds, kernelSeconds, graphSeconds, firstFrameSeconds);
-  const vk::Context::MemoryUse& memory = context.memoryUse();
+  const exec::Device::MemoryUse memory = context.memoryUse();
   printf("memory: %.0f MiB device-local in use (raw tensors %.0f MiB, re-laid weights %.0f MiB, activations and scratch "
          "%.0f MiB), peak %.0f MiB; host-visible %.0f MiB\n",
          mib(memory.deviceLocal), mib(modelBytes), mib(model.matrixBytes()),
@@ -662,17 +666,18 @@ int runBench(int argc, char** argv) {
   VkCommandPool secondaryPool = VK_NULL_HANDLE;
   VkCommandBuffer prerecorded = VK_NULL_HANDLE;
   if (secondary) {
+    if (!vulkan) throw std::runtime_error("--secondary is a Vulkan secondary command buffer: not available on this API");
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    poolInfo.queueFamilyIndex = context.queueFamily();
-    VK_CHECK(vkCreateCommandPool(context.device(), &poolInfo, nullptr, &secondaryPool));
+    poolInfo.queueFamilyIndex = vulkan->queueFamily();
+    VK_CHECK(vkCreateCommandPool(vulkan->device(), &poolInfo, nullptr, &secondaryPool));
     VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocate.commandPool = secondaryPool; allocate.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY; allocate.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(context.device(), &allocate, &prerecorded));
+    VK_CHECK(vkAllocateCommandBuffers(vulkan->device(), &allocate, &prerecorded));
     VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
     begin.pInheritanceInfo = &inheritance;
-    context.resetDescriptorPool(0);
+    vulkan->resetDescriptorPool(0);
     VK_CHECK(vkBeginCommandBuffer(prerecorded, &begin));
     graph->record(prerecorded, *features);
     VK_CHECK(vkEndCommandBuffer(prerecorded));
@@ -680,11 +685,11 @@ int runBench(int argc, char** argv) {
   }
   for (int frame = 0; frame < frames; ++frame) {
     const auto frameStart = std::chrono::high_resolution_clock::now();
-    if (!secondary) context.resetDescriptorPool();
-    VkCommandBuffer commands = context.beginCommands();
+    if (!secondary) context.nextFrame();
+    exec::Commands commands = context.beginCommands();
     context.resetTimestamps(commands, queries, 2);
     context.writeTimestamp(commands, queries, 0, true);
-    if (secondary) vkCmdExecuteCommands(commands, 1, &prerecorded);
+    if (secondary) vkCmdExecuteCommands(vk::handle(commands), 1, &prerecorded);
     else graph->record(commands, *features);
     context.writeTimestamp(commands, queries, 1, false);
     context.endAndSubmit(commands, true);
@@ -700,7 +705,7 @@ int runBench(int argc, char** argv) {
   std::sort(wallSamples.begin(), wallSamples.end());
   printf("host frame: median %.3f ms (recording + submission + GPU wait; readback excluded)\n", wallSamples[wallSamples.size() / 2]);
   context.destroyTimestampPool(queries);
-  if (secondaryPool) vkDestroyCommandPool(context.device(), secondaryPool, nullptr);
+  if (secondaryPool) vkDestroyCommandPool(vulkan->device(), secondaryPool, nullptr);
   return 0;
 }
 
@@ -759,8 +764,9 @@ int runImage(int argc, char** argv) {
       throw std::runtime_error("image input contains a value outside [0, 1] at float " + std::to_string(i));
   }
 
-  vk::Context context;
-  printf("device: %s\n", context.deviceName().c_str());
+  const std::unique_ptr<exec::Device> owned = makeDevice();
+  exec::Device& context = *owned;
+  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
   auto started = std::chrono::steady_clock::now();
   nr::Model model(context, modelDir, !hasFlag(argc, argv, "--no-verify"));
   printf("model loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
@@ -782,7 +788,7 @@ int runImage(int argc, char** argv) {
   context.upload(proxy, inputBytes.data(), inputBytes.size());
   nr::Kernels::PreprocessArgs preprocess{geometry.fullWidth, geometry.fullHeight, width, height, width, height, seed,
                                          autoMask, tone, structure, skin, style};
-  VkCommandBuffer commands = context.beginCommands();
+  exec::Commands commands = context.beginCommands();
   kernels.preprocessFromProxy(commands, proxy, features, preprocess);
   context.endAndSubmit(commands, true);
 
@@ -837,7 +843,7 @@ int runShaderInfo(int argc, char** argv) {
   nr::Geometry geometry = nr::Geometry::fromValid(768, 768);
   nr::Graph graph(context, model, kernels, geometry, {.fusedBlocks = fusedBlocksEnabled()});
   nr::Activation* features = graph.allocate("input features", geometry.fullWidth * geometry.fullHeight, 16, nr::Format::F32);
-  VkCommandBuffer commands = context.beginCommands();
+  exec::Commands commands = context.beginCommands();
   graph.record(commands, *features);
   context.endAndSubmit(commands, true);
   checkChainTimeouts(kernels);
@@ -856,8 +862,11 @@ int runProfile(int argc, char** argv) {
   uint32_t width = (uint32_t)atoi(argValue(argc, argv, "--width", "768").c_str());
   uint32_t height = (uint32_t)atoi(argValue(argc, argv, "--height", "768").c_str());
   if (modelDir.empty()) { fprintf(stderr, "usage: dlss5vk profile --model <dir> [--width W --height H]\n"); return 2; }
-  vk::Context context;
-  printf("maxComputeSharedMemorySize %u bytes\n", context.maxComputeSharedMemory());
+  const std::unique_ptr<exec::Device> owned = makeDevice();
+  exec::Device& context = *owned;
+  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
+  if (const vk::Context* vulkan = dynamic_cast<const vk::Context*>(owned.get()))
+    printf("maxComputeSharedMemorySize %u bytes\n", vulkan->maxComputeSharedMemory());
   nr::Model model(context, modelDir, false);
   nr::Kernels kernels(context, shaderDir);
   if (!getenv("DLSS5VK_CHAIN")) kernels.setChainEnabled(false);   // per-dispatch timings need the barriers
@@ -869,7 +878,7 @@ int runProfile(int argc, char** argv) {
     nr::Activation tinyOut = tiny; tinyOut.format = nr::Format::E4;
     tinyOut.buffer = context.createBuffer(64 * 16, false, "tiny out");
     exec::Timer pool = context.createTimestampPool(2);
-    VkCommandBuffer commands = context.beginCommands();
+    exec::Commands commands = context.beginCommands();
     context.resetTimestamps(commands, pool, 2);
     context.writeTimestamp(commands, pool, 0, true);
     for (int i = 0; i < 400; ++i) kernels.quantize(commands, tiny, tinyOut);
@@ -879,7 +888,7 @@ int runProfile(int argc, char** argv) {
     printf("400 trivial dispatches + barriers: %.3f ms (%.2f us each)\n", stamps[1] - stamps[0], (stamps[1] - stamps[0]) * 2.5);
     context.destroyTimestampPool(pool);
     context.destroyBuffer(tiny.buffer); context.destroyBuffer(tinyOut.buffer);
-    context.resetDescriptorPool();
+    context.nextFrame();
   }
   nr::Geometry geometry = nr::Geometry::fromValid(width, height);
   nr::Graph graph(context, model, kernels, geometry, {.fusedBlocks = fusedBlocksEnabled()});
@@ -889,7 +898,7 @@ int runProfile(int argc, char** argv) {
   for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = num::roundF16(std::sin(i * 0.0017f) * 0.125f);
   context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
   {
-    VkCommandBuffer commands = context.beginCommands();
+    exec::Commands commands = context.beginCommands();
     graph.record(commands, *features);
     context.endAndSubmit(commands, true);
     checkChainTimeouts(kernels);
@@ -901,8 +910,8 @@ int runProfile(int argc, char** argv) {
   const int frames = atoi(argValue(argc, argv, "--frames", "7").c_str());
   std::vector<nr::Kernels::ProfileEntry> best;
   for (int frame = 0; frame < frames; ++frame) {
-    context.resetDescriptorPool();
-    VkCommandBuffer commands = context.beginCommands();
+    context.nextFrame();
+    exec::Commands commands = context.beginCommands();
     kernels.beginProfile(commands, 4096);
     graph.record(commands, *features);
     context.endAndSubmit(commands, true);
@@ -958,7 +967,7 @@ int main(int argc, char** argv) {
   // With the validation layer on, an error it reported fails the run, whatever the command concluded.
   const char* validation = getenv("DLSS5VK_VALIDATION");
   if (validation && *validation && strcmp(validation, "0")) {
-    const uint32_t errors = vk::Context::validationErrors();
+    const uint32_t errors = deviceValidationErrors();
     printf("validation: %u error%s reported by the layer\n", errors, errors == 1 ? "" : "s");
     if (errors && code == 0) code = 1;
   }

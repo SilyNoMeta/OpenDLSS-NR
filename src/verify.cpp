@@ -133,7 +133,7 @@ int runVerify(int argc, char** argv) {
     if (entry["block"].integer() == 0) block0File = fixtureDir + "/" + entry["file"].str();
   if (block0File.empty()) throw std::runtime_error("verify needs the fixture's block-0 reference");
   context.upload(features->buffer, featureBytes.data(), featureBytes.size());
-  VkCommandBuffer commands = context.beginCommands();
+  exec::Commands commands = context.beginCommands();
   graph.record(commands, *features);
   context.endAndSubmit(commands, true);
   printf("graph executed; checking block 0 against the CPU reference on %u rows\n", sampleRows);

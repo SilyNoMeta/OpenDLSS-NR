@@ -96,6 +96,7 @@ class Device {
   // address). An adapter without that runs every launch behind a barrier.
   virtual bool chainSupported() const = 0;
   virtual uint32_t smCount() const = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
+  virtual const std::string& deviceName() const = 0;
 
   // Buffers -------------------------------------------------------------------
   // `usage` is extra API-specific usage the caller needs (Vulkan buffer usage bits); 0 for the kernels' own buffers.
@@ -130,6 +131,16 @@ class Device {
   virtual void transferBarrier(Commands commands) = 0;   // kernel / transfer -> kernel / transfer
   virtual void zeroBuffer(Commands commands, const Buffer& target) = 0;
   virtual void copyBuffer(Commands commands, const Buffer& source, const Buffer& target, Size bytes) = 0;
+
+  // A device that owns its queue (the tool, the tests, a bridge) -------------------------
+  // One-shot command streams; a device borrowed from a host records into the host's stream instead and throws here.
+  virtual Commands beginCommands() = 0;
+  virtual void endAndSubmit(Commands commands, bool wait = true) = 0;
+  virtual void nextFrame() {}   // transient per-frame state (descriptor sets) may be recycled
+
+  // Bytes of every buffer this device created, device-local and host-visible apart, current and peak.
+  struct MemoryUse { Size deviceLocal = 0, hostVisible = 0, peakDeviceLocal = 0; };
+  virtual MemoryUse memoryUse() const = 0;
 
   // Timestamps --------------------------------------------------------------------
   virtual Timer createTimestampPool(uint32_t count) = 0;

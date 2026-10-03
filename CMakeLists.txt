@@ -36,7 +36,15 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(dlss5vk_volk PUBLIC dl)
 endif()
 
+# The Direct3D 12 / 11 adapters (NVIDIA's CUDA interop through the driver's nvapi64.dll, resolved at run time).
+set(DLSS5VK_D3D_SOURCES "")
+if(WIN32)
+    set(DLSS5VK_D3D_SOURCES src/d3d/d3d_common.cpp src/d3d/d3d12_device.cpp src/d3d/d3d11_device.cpp)
+endif()
+
 add_executable(dlss5vk
+    ${DLSS5VK_D3D_SOURCES}
+    src/device_factory.cpp
     src/exec.cpp
     src/gpu_arch.cpp
     src/kernels.cpp
@@ -48,6 +56,9 @@ add_executable(dlss5vk
     src/vk_context.cpp)
 target_include_directories(dlss5vk PRIVATE src)
 target_link_libraries(dlss5vk PRIVATE dlss5vk_volk)
+if(WIN32)
+    target_link_libraries(dlss5vk PRIVATE d3d12 d3d11 dxgi d3dcompiler dxguid)
+endif()
 target_compile_definitions(dlss5vk PRIVATE VK_NO_PROTOTYPES VK_ENABLE_BETA_EXTENSIONS)
 
 if(MSVC)
