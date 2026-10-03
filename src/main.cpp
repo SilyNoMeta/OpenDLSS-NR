@@ -13,6 +13,7 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -608,7 +609,23 @@ int runBench(int argc, char** argv) {
   uint32_t width = (uint32_t)atoi(argValue(argc, argv, "--width", "768").c_str());
   uint32_t height = (uint32_t)atoi(argValue(argc, argv, "--height", "768").c_str());
   int frames = atoi(argValue(argc, argv, "--frames", "10").c_str());
-  if (modelDir.empty()) { fprintf(stderr, "usage: dlss5vk bench --model <dir> [--width W --height H --frames N]\n"); return 2; }
+  if (modelDir.empty()) {
+    fprintf(stderr, "usage: dlss5vk bench --model <dir> [--width W --height H | --fixture <proxy fixture>] [--frames N] [--tape] [--json <file>]\n");
+    return 2;
+  }
+  // --fixture: the frames a proxy fixture describes (its size, its features generated from its proxy), so that every
+  // execution mode a harness compares runs the same frames. Without it, a synthetic field of --width x --height.
+  const std::string fixtureDir = argValue(argc, argv, "--fixture");
+  json::Value fixtureManifest;
+  FixturePlan fixture;
+  std::vector<uint8_t> fixtureProxy;
+  if (!fixtureDir.empty()) {
+    fixtureManifest = json::parse(readText(fixtureDir + "/manifest.json"));
+    fixture = planFixture(fixtureManifest, fixtureDir);
+    if (fixture.proxyFile.empty()) throw std::runtime_error("bench --fixture needs a proxy fixture");
+    fixtureProxy = readFile(fixture.proxyFile);
+    width = fixture.validWidth; height = fixture.validHeight;
+  }
   // Preparation (once) and the recurring frame are reported apart: device and model setup, kernels, the graph
   // build, and the first frame, which pays for the pipeline and PTX compilation the later frames reuse.
   using Clock = std::chrono::steady_clock;
@@ -639,17 +656,42 @@ int runBench(int argc, char** argv) {
   for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = num::roundF16(std::sin(i * 0.0017f) * 0.125f);
   std::unique_ptr<nr::Graph> graph;
   nr::Activation* features = nullptr;
+  exec::Buffer fixtureBuffer;
+  std::optional<nr::Kernels::PreprocessArgs> preprocess;
+  exec::Tape preprocessTape;
   auto build = [&]() {
     graph.reset();
     graph = std::make_unique<nr::Graph>(context, model, kernels, geometry, nr::Graph::Options{.fusedBlocks = fusedBlocksEnabled()});
     features = graph->allocate("input features", fullRows, 16, nr::Format::F32);
-    context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
+    if (fixtureProxy.empty()) {
+      context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
+    } else {
+      // The fixture's frame is its proxy: every frame generates the features from it and then runs the graph, which
+      // is what a host's frame does (and what dlss5vk bridge runs on the Vulkan side).
+      if (!fixtureBuffer.buffer) {
+        fixtureBuffer = context.createBuffer(fixtureProxy.size(), false, "proxy");
+        context.upload(fixtureBuffer, fixtureProxy.data(), fixtureProxy.size());
+      }
+      const json::Value& conditioning = fixtureManifest["conditioning"];
+      preprocess = nr::Kernels::PreprocessArgs{geometry.fullWidth, geometry.fullHeight, fixture.validWidth, fixture.validHeight,
+                                               fixture.proxyWidth, fixture.proxyHeight, (uint32_t)fixtureManifest["seed"].integer(),
+                                               fixtureManifest["autoMask"].boolean, (float)conditioning["localTone"].number,
+                                               (float)conditioning["localStructure"].number, (float)conditioning["skinStructure"].number,
+                                               (float)conditioning["style"].number};
+      if (taped) { kernels.preprocessFromProxy(tapeRecorder.stream(), fixtureBuffer, *features, *preprocess); preprocessTape = tapeRecorder.take(); }
+    }
     if (taped) { graph->record(tapeRecorder.stream(), *features); tape = tapeRecorder.take(); }
   };
-  auto emit = [&](exec::Commands commands) {
+  auto emitPreprocess = [&](exec::Commands commands) {
+    if (!preprocess) return;
+    if (taped) preprocessTape.replay(*owned, commands);
+    else kernels.preprocessFromProxy(commands, fixtureBuffer, *features, *preprocess);
+  };
+  auto emitGraph = [&](exec::Commands commands) {
     if (taped) tape.replay(*owned, commands);
     else graph->record(commands, *features);
   };
+  auto emit = [&](exec::Commands commands) { emitPreprocess(commands); emitGraph(commands); };
   started = Clock::now();
   build();
   const double graphSeconds = seconds(started);
@@ -682,8 +724,8 @@ int runBench(int argc, char** argv) {
          "%.0f MiB), peak %.0f MiB; host-visible %.0f MiB\n",
          mib(memory.deviceLocal), mib(modelBytes), mib(model.matrixBytes()),
          mib(memory.deviceLocal - modelBytes - model.matrixBytes()), mib(memory.peakDeviceLocal), mib(memory.hostVisible));
-  exec::Timer queries = context.createTimestampPool(2);
-  std::vector<double> samples;
+  exec::Timer queries = context.createTimestampPool(3);
+  std::vector<double> samples, submissionSamples;   // the graph alone, and everything the frame submits
   std::vector<double> wallSamples, recordSamples, submitSamples;
   auto milliseconds = [](std::chrono::high_resolution_clock::time_point from) {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - from).count();
@@ -715,22 +757,25 @@ int runBench(int argc, char** argv) {
     const auto frameStart = std::chrono::high_resolution_clock::now();
     if (!secondary) context.nextFrame();
     exec::Commands commands = context.beginCommands();
-    owned->resetTimestamps(commands, queries, 2);
+    owned->resetTimestamps(commands, queries, 3);
     owned->writeTimestamp(commands, queries, 0, true);
     // Recording is host time every frame (an immediate context executes while it records: there the split between
     // recording and waiting is where the driver chooses to flush, and only their sum means something).
     const auto recordStart = std::chrono::high_resolution_clock::now();
-    if (secondary) vkCmdExecuteCommands(vk::handle(commands), 1, &prerecorded);
-    else emit(commands);
-    recordSamples.push_back(milliseconds(recordStart));
+    emitPreprocess(commands);
     owned->writeTimestamp(commands, queries, 1, false);
+    if (secondary) vkCmdExecuteCommands(vk::handle(commands), 1, &prerecorded);
+    else emitGraph(commands);
+    recordSamples.push_back(milliseconds(recordStart));
+    owned->writeTimestamp(commands, queries, 2, false);
     const auto submitStart = std::chrono::high_resolution_clock::now();
     context.endAndSubmit(commands, true);
     submitSamples.push_back(milliseconds(submitStart));
     wallSamples.push_back(milliseconds(frameStart));
     checkChainTimeouts(kernels);
-    std::vector<double> stamps = context.readTimestampsMs(queries, 2);
-    samples.push_back(stamps[1] - stamps[0]);
+    std::vector<double> stamps = context.readTimestampsMs(queries, 3);
+    samples.push_back(stamps[2] - stamps[1]);
+    submissionSamples.push_back(stamps[2] - stamps[0]);
     printf("frame %d: %.3f ms GPU (%u dispatches)\n", frame, samples.back(), kernels.dispatchCount());
   }
   // Machine-readable samples, in frame order, for a harness that alternates configurations (--json <file>).
@@ -752,7 +797,11 @@ int runBench(int argc, char** argv) {
          << ", \"graph\": " << graphSeconds << ", \"first_frame\": " << firstFrameSeconds << "},\n";
     json << "  \"memory_bytes\": {\"device_local\": " << memory.deviceLocal << ", \"peak_device_local\": " << memory.peakDeviceLocal
          << ", \"host_visible\": " << memory.hostVisible << ", \"raw_tensors\": " << modelBytes << ", \"weights\": " << model.matrixBytes() << "},\n";
+    // gpu_ms is the graph alone; gpu_submission_ms is everything the frame submits (with --fixture, the features
+    // generated from the proxy and then the graph).
+    json << "  \"frame_work\": \"" << (preprocess ? "preprocess+graph" : "graph") << "\",\n";
     list("gpu_ms", samples);
+    list("gpu_submission_ms", submissionSamples);
     list("record_ms", recordSamples);
     list("submit_wait_ms", submitSamples);
     json << "  \"host_frame_ms\": [";
@@ -763,9 +812,11 @@ int runBench(int argc, char** argv) {
   std::sort(samples.begin(), samples.end());
   printf("median %.3f ms, min %.3f ms over %d frames at %ux%u (full %ux%u)\n", samples[samples.size() / 2],
          samples.front(), frames, width, height, geometry.fullWidth, geometry.fullHeight);
+  if (preprocess) printf("with the features generated from the proxy: median %.3f ms GPU per frame\n", median(submissionSamples));
   printf("host frame: median %.3f ms (recording %.3f ms + submission and GPU wait %.3f ms; readback excluded)\n", median(wallSamples),
          median(recordSamples), median(submitSamples));
   context.destroyTimestampPool(queries);
+  if (fixtureBuffer.buffer) context.destroyBuffer(fixtureBuffer);
   if (secondaryPool) vkDestroyCommandPool(vulkan->device(), secondaryPool, nullptr);
   return 0;
 }

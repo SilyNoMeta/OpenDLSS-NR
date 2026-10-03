@@ -369,6 +369,8 @@ ToolResult runTool(const ToolInput& input) {
          vulkan.deviceName().c_str(), exec::backendName(vulkan.backend()), input.transportOnly ? " (transport only)" : "");
 
   std::vector<double> hostWriteMs, vulkanCpuMs, hostReadMs, wallMs, gpuTotalMs, gpuGraphMs;
+  exec::Device::MemoryUse memory;   // of the Vulkan device, while the graph is alive
+  double prepareSeconds = 0;
   uint32_t failures = 0;
   auto require = [&](bool ok, const std::string& what) {
     printf("%s: %s\n", what.c_str(), ok ? "identical" : "DIFFERENT");
@@ -457,7 +459,7 @@ ToolResult runTool(const ToolInput& input) {
     SharedTexture proxyTexture = link->createTexture(input.proxyWidth, input.proxyHeight);
     SharedTexture headTexture = link->createTexture(geometry.fullWidth, geometry.fullHeight);
     exec::Timer stamps = vulkan.createTimestampPool(4);
-    const double prepareSeconds = since(prepareStart) / 1000.0;
+    prepareSeconds = since(prepareStart) / 1000.0;
     printf("preparation %.2f s (device, model, kernels, graph, shared textures; kernel compilation falls in the first frame)\n", prepareSeconds);
     printf("graph: %zu launches and %zu dispatches per frame, %s kernels, chaining off\n", graphTape.launches(), graphTape.dispatches(),
            vulkan.nativeFp8() ? "cooperative-matrix GLSL and PTX" : "PTX and exact scalar");
@@ -519,6 +521,7 @@ ToolResult runTool(const ToolInput& input) {
     }
     if (!input.dumpDir.empty())
       std::ofstream(input.dumpDir + "/head.f32", std::ios::binary).write(reinterpret_cast<const char*>(result.head.data()), result.head.size());
+    memory = vulkan.memoryUse();
     vulkan.destroyTimestampPool(stamps);
     vulkan.destroyBuffer(proxyBuffer);
     link->destroyTexture(proxyTexture);
@@ -538,9 +541,10 @@ ToolResult runTool(const ToolInput& input) {
     json << "  \"shader_fp8\": " << (vulkan.nativeFp8() ? "true" : "false") << ", \"taped\": true, \"chained\": false,\n";
     json << "  \"width\": " << input.validWidth << ", \"height\": " << input.validHeight << ", \"full_width\": " << input.fullWidth
          << ", \"full_height\": " << input.fullHeight << ", \"transport_width\": " << input.proxyWidth << ", \"transport_height\": " << input.proxyHeight << ",\n";
-    const exec::Device::MemoryUse memory = vulkan.memoryUse();
+    json << "  \"preparation_s\": {\"all_before_first_frame\": " << prepareSeconds << ", \"first_frame\": " << (wallMs.empty() ? 0.0 : wallMs[0] / 1000.0) << "},\n";
     json << "  \"memory_bytes\": {\"device_local\": " << memory.deviceLocal << ", \"peak_device_local\": " << memory.peakDeviceLocal
          << ", \"host_visible\": " << memory.hostVisible << "},\n";
+    json << "  \"frame_work\": \"" << (input.transportOnly ? "image copies" : "image to buffer+preprocess+graph+buffer to image") << "\",\n";
     json << "  \"debug_errors\": " << hostErrors << ", \"failures\": " << failures << ",\n";
     writeList(json, "gpu_ms", gpuGraphMs);
     writeList(json, "gpu_submission_ms", gpuTotalMs);
