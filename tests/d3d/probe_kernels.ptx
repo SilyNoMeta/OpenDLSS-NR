@@ -1,0 +1,93 @@
+//
+// Elementary kernels of tests/d3d/cuda_probe.cpp: integer arithmetic whose result the CPU computes exactly, so a
+// wrong address, a mis-packed argument, a missing shared-memory size or a lost dependency shows as wrong bytes.
+// sm_80: runs on every GPU the NR kernels target (Ampere, Ada, Blackwell).
+//
+.version 8.7
+.target sm_80
+.address_size 64
+
+.extern .shared .align 4 .b8 smem[];
+
+// out[i] = (in[i] * scale + bias + i) ^ lo32(mask) ^ hi32(mask), i = ctaid.x * ntid.x + tid.x < count.
+// The argument order alternates 64- and 32-bit values on purpose: the packed buffer has a hole after `count`.
+.visible .entry probe_affine(.param .u64 pIn, .param .u32 count, .param .u64 pOut, .param .u32 scale, .param .u32 bias, .param .u64 mask)
+{
+  .reg .b64 %rd<8>;
+  .reg .b32 %r<12>;
+  .reg .pred %p<1>;
+
+  ld.param.u64 %rd0, [pIn];
+  ld.param.u32 %r0, [count];
+  ld.param.u64 %rd1, [pOut];
+  ld.param.u32 %r1, [scale];
+  ld.param.u32 %r2, [bias];
+  ld.param.u64 %rd2, [mask];
+  mov.u32 %r3, %tid.x;
+  mov.u32 %r4, %ctaid.x;
+  mov.u32 %r5, %ntid.x;
+  mad.lo.u32 %r6, %r4, %r5, %r3;
+  setp.ge.u32 %p0, %r6, %r0;
+  @%p0 bra AFFINE_END;
+  cvt.u64.u32 %rd3, %r6;
+  shl.b64 %rd3, %rd3, 2;
+  add.u64 %rd4, %rd0, %rd3;
+  ld.global.u32 %r7, [%rd4];
+  mad.lo.u32 %r8, %r7, %r1, %r2;
+  add.u32 %r8, %r8, %r6;
+  cvt.u32.u64 %r9, %rd2;
+  shr.u64 %rd5, %rd2, 32;
+  cvt.u32.u64 %r10, %rd5;
+  xor.b32 %r8, %r8, %r9;
+  xor.b32 %r8, %r8, %r10;
+  add.u64 %rd6, %rd1, %rd3;
+  st.global.u32 [%rd6], %r8;
+AFFINE_END:
+  ret;
+}
+
+// Every thread parks its input in launch-sized shared memory, the block synchronizes, and each thread publishes
+// its right-hand neighbour's value (wrapping in the block) plus ctaid.x << 16:
+//   out[i] = (j < count ? in[j] : 0) + (b << 16),  b = i / ntid, j = b * ntid + (i % ntid + 1) % ntid.
+// Needs dynamicSharedBytes >= 4 * ntid.x, a barrier, and the block's threads to be co-resident.
+.visible .entry probe_shared(.param .u64 pIn, .param .u64 pOut, .param .u32 count)
+{
+  .reg .b64 %rd<8>;
+  .reg .b32 %r<16>;
+  .reg .pred %p<1>;
+
+  ld.param.u64 %rd0, [pIn];
+  ld.param.u64 %rd1, [pOut];
+  ld.param.u32 %r0, [count];
+  mov.u32 %r1, %tid.x;
+  mov.u32 %r2, %ctaid.x;
+  mov.u32 %r3, %ntid.x;
+  mad.lo.u32 %r4, %r2, %r3, %r1;
+  mov.u32 %r5, 0;
+  setp.lt.u32 %p0, %r4, %r0;
+  @!%p0 bra SHARED_STORE;
+  cvt.u64.u32 %rd2, %r4;
+  shl.b64 %rd2, %rd2, 2;
+  add.u64 %rd3, %rd0, %rd2;
+  ld.global.u32 %r5, [%rd3];
+SHARED_STORE:
+  mov.u32 %r6, smem;
+  shl.b32 %r7, %r1, 2;
+  add.u32 %r8, %r6, %r7;
+  st.shared.u32 [%r8], %r5;
+  bar.sync 0;
+  add.u32 %r9, %r1, 1;
+  rem.u32 %r9, %r9, %r3;
+  shl.b32 %r10, %r9, 2;
+  add.u32 %r11, %r6, %r10;
+  ld.shared.u32 %r12, [%r11];
+  @!%p0 bra SHARED_END;
+  shl.b32 %r13, %r2, 16;
+  add.u32 %r12, %r12, %r13;
+  cvt.u64.u32 %rd4, %r4;
+  shl.b64 %rd4, %rd4, 2;
+  add.u64 %rd5, %rd1, %rd4;
+  st.global.u32 [%rd5], %r12;
+SHARED_END:
+  ret;
+}
