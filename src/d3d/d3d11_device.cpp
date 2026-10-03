@@ -51,16 +51,7 @@ void checkNv(nvcuda::Status status, const std::string& what) {
 }  // namespace
 
 D3D11Device::D3D11Device(exec::Backend backend, bool debugLayer) : backend_(backend) {
-  ComPtr<IDXGIFactory6> factory;
-  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
-  ComPtr<IDXGIAdapter1> adapter, chosen;
-  for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
-    DXGI_ADAPTER_DESC1 desc{};
-    adapter->GetDesc1(&desc);
-    if (desc.VendorId == 0x10de && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) { chosen = adapter; break; }
-    adapter.Reset();
-  }
-  if (!chosen) throw std::runtime_error("no NVIDIA adapter for the d3d11 execution");
+  const ComPtr<IDXGIAdapter1> chosen = nvidiaAdapter();
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
   D3D_FEATURE_LEVEL level{};
   const HRESULT hr = D3D11CreateDevice(chosen.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, debugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0, levels, 2,

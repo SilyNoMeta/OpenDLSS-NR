@@ -30,19 +30,10 @@ exec::Backend direct3dBackend() {
   if (text == "sm86") return exec::Backend::Sm86;
   if (text == "compat") return exec::Backend::Compat;   // refused by the adapter, with the reason
   if (!text.empty() && text != "auto") throw std::runtime_error("DLSS5VK_BACKEND=" + text + ": expected auto, native or sm86 on Direct3D");
-  Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
-  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) throw std::runtime_error("CreateDXGIFactory1 failed");
-  Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-  for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
-    DXGI_ADAPTER_DESC1 desc{};
-    adapter->GetDesc1(&desc);
-    if (desc.VendorId == 0x10de && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-      const d3d::GpuInfo gpu = d3d::gpuInfo((uint64_t)(uint32_t)desc.AdapterLuid.LowPart | ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32));
-      return (gpu.major > 8 || (gpu.major == 8 && gpu.minor >= 9)) ? exec::Backend::Native : exec::Backend::Sm86;
-    }
-    adapter.Reset();
-  }
-  throw std::runtime_error("no NVIDIA adapter");
+  DXGI_ADAPTER_DESC1 desc{};
+  d3d::nvidiaAdapter()->GetDesc1(&desc);
+  const d3d::GpuInfo gpu = d3d::gpuInfo((uint64_t)(uint32_t)desc.AdapterLuid.LowPart | ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32));
+  return (gpu.major > 8 || (gpu.major == 8 && gpu.minor >= 9)) ? exec::Backend::Native : exec::Backend::Sm86;
 }
 #endif
 }  // namespace
@@ -55,16 +46,16 @@ std::unique_ptr<exec::Device> makeDevice() {
   const bool debug = !validation.empty() && validation != "0";
   if (api == "d3d12") {
     auto device = std::make_unique<d3d::D3D12Device>(direct3dBackend(), debug);
-    fprintf(stderr, "backend: %s - %s (d3d12, compute capability %d.%d, %u SMs%s)\n", exec::backendName(device->backend()),
-            exec::backendDescription(device->backend()), device->gpu().major, device->gpu().minor, device->gpu().smCount,
-            debug ? ", debug layer" : "");
+    fprintf(stderr, "backend: %s - %s (d3d12, adapter LUID %016llX, compute capability %d.%d, %u SMs%s)\n", exec::backendName(device->backend()),
+            exec::backendDescription(device->backend()), (unsigned long long)device->gpu().luid, device->gpu().major, device->gpu().minor,
+            device->gpu().smCount, debug ? ", debug layer" : "");
     return device;
   }
   if (api == "d3d11") {
     auto device = std::make_unique<d3d::D3D11Device>(direct3dBackend(), debug);
-    fprintf(stderr, "backend: %s - %s (d3d11, compute capability %d.%d, %u SMs%s)\n", exec::backendName(device->backend()),
-            exec::backendDescription(device->backend()), device->gpu().major, device->gpu().minor, device->gpu().smCount,
-            debug ? ", debug layer" : "");
+    fprintf(stderr, "backend: %s - %s (d3d11, adapter LUID %016llX, compute capability %d.%d, %u SMs%s)\n", exec::backendName(device->backend()),
+            exec::backendDescription(device->backend()), (unsigned long long)device->gpu().luid, device->gpu().major, device->gpu().minor,
+            device->gpu().smCount, debug ? ", debug layer" : "");
     return device;
   }
 #endif

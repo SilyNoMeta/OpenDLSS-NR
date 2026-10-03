@@ -2,6 +2,9 @@
 // HLSL twins of the shader kernels.
 #pragma once
 #ifdef _WIN32
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -16,11 +19,15 @@ namespace d3d {
 // adapter LUID. No CUDA context is created. Throws when the adapter is not an NVIDIA GPU the driver lists.
 struct GpuInfo {
   std::string name;
-  uint64_t luid = 0;
+  uint64_t luid = 0;           // the adapter asked about
+  uint64_t cudaLuid = 0;       // the LUID the driver's CUDA library reports for that GPU (differs when DXGI lists it twice)
   uint32_t smCount = 0;        // streaming multiprocessors
   int major = 0, minor = 0;    // compute capability
 };
 GpuInfo gpuInfo(uint64_t luid);
+// The NVIDIA adapter a device of this module's own is created on: the one whose LUID is a CUDA device's (the
+// identity Vulkan and CUDA report for the GPU), else the first NVIDIA adapter; DLSS5VK_ADAPTER_LUID=<hex> names one.
+Microsoft::WRL::ComPtr<IDXGIAdapter1> nvidiaAdapter();
 
 // The numeric routes a Direct3D adapter runs, checked against the GPU; throws with the reason otherwise. sm86 needs
 // an Ampere GPU (compute capability 8.0 to 8.7), native FP8 tensor cores (8.9 or later). compat, the scalar

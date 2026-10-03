@@ -57,16 +57,7 @@ struct D3D12Device::Stream {
 };
 
 D3D12Device::D3D12Device(exec::Backend backend, bool debugLayer) : backend_(backend) {
-  ComPtr<IDXGIFactory6> factory;
-  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
-  ComPtr<IDXGIAdapter1> adapter, chosen;
-  for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
-    DXGI_ADAPTER_DESC1 desc{};
-    adapter->GetDesc1(&desc);
-    if (desc.VendorId == 0x10de && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) { chosen = adapter; break; }
-    adapter.Reset();
-  }
-  if (!chosen) throw std::runtime_error("no NVIDIA adapter for the d3d12 execution");
+  const ComPtr<IDXGIAdapter1> chosen = nvidiaAdapter();
   if (debugLayer) {
     ComPtr<ID3D12Debug> layer;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) { layer->EnableDebugLayer(); debugLayer_ = true; }
