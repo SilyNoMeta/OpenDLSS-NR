@@ -391,14 +391,14 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
     options.fusedBlocks = fusedBlocksEnabled();
     nr::Graph graph(context, model, kernels, geometry, options);
     run.chained = graph.chained();
-    VkQueryPool queries = context.createTimestampPool(2);
+    exec::Timer queries = context.createTimestampPool(2);
     for (int submission = 0; submission < submissions; ++submission) {
       context.resetDescriptorPool();
       VkCommandBuffer commands = context.beginCommands();
-      vkCmdResetQueryPool(commands, queries, 0, 2);
-      vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
+      context.resetTimestamps(commands, queries, 2);
+      context.writeTimestamp(commands, queries, 0, true);
       graph.record(commands, features);
-      vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
+      context.writeTimestamp(commands, queries, 1, false);
       context.endAndSubmit(commands, true);
       checkChainTimeouts(kernels);
       std::vector<double> stamps = context.readTimestampsMs(queries, 2);
@@ -408,7 +408,7 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
       if (submission == 0) run.head = std::move(head);
       else run.repeatable = run.repeatable && head == run.head;
     }
-    vkDestroyQueryPool(context.device(), queries, nullptr);
+    context.destroyTimestampPool(queries);
     for (const auto& [name, activation] : graph.boundaries())
       run.boundaries[name] = context.download(activation->buffer, activation->validBytes());
   }
@@ -653,7 +653,7 @@ int runBench(int argc, char** argv) {
          "%.0f MiB), peak %.0f MiB; host-visible %.0f MiB\n",
          mib(memory.deviceLocal), mib(modelBytes), mib(model.matrixBytes()),
          mib(memory.deviceLocal - modelBytes - model.matrixBytes()), mib(memory.peakDeviceLocal), mib(memory.hostVisible));
-  VkQueryPool queries = context.createTimestampPool(2);
+  exec::Timer queries = context.createTimestampPool(2);
   std::vector<double> samples;
   std::vector<double> wallSamples;
   // --secondary: the demo's (and a host's) way, the graph recorded once into a secondary command buffer that every
@@ -682,11 +682,11 @@ int runBench(int argc, char** argv) {
     const auto frameStart = std::chrono::high_resolution_clock::now();
     if (!secondary) context.resetDescriptorPool();
     VkCommandBuffer commands = context.beginCommands();
-    vkCmdResetQueryPool(commands, queries, 0, 2);
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
+    context.resetTimestamps(commands, queries, 2);
+    context.writeTimestamp(commands, queries, 0, true);
     if (secondary) vkCmdExecuteCommands(commands, 1, &prerecorded);
     else graph->record(commands, *features);
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
+    context.writeTimestamp(commands, queries, 1, false);
     context.endAndSubmit(commands, true);
     wallSamples.push_back(std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - frameStart).count());
     checkChainTimeouts(kernels);
@@ -699,7 +699,7 @@ int runBench(int argc, char** argv) {
          samples.front(), frames, width, height, geometry.fullWidth, geometry.fullHeight);
   std::sort(wallSamples.begin(), wallSamples.end());
   printf("host frame: median %.3f ms (recording + submission + GPU wait; readback excluded)\n", wallSamples[wallSamples.size() / 2]);
-  vkDestroyQueryPool(context.device(), queries, nullptr);
+  context.destroyTimestampPool(queries);
   if (secondaryPool) vkDestroyCommandPool(context.device(), secondaryPool, nullptr);
   return 0;
 }
@@ -868,16 +868,16 @@ int runProfile(int argc, char** argv) {
     tiny.buffer = context.createBuffer(64 * 16 * 2, false, "tiny");
     nr::Activation tinyOut = tiny; tinyOut.format = nr::Format::E4;
     tinyOut.buffer = context.createBuffer(64 * 16, false, "tiny out");
-    VkQueryPool pool = context.createTimestampPool(2);
+    exec::Timer pool = context.createTimestampPool(2);
     VkCommandBuffer commands = context.beginCommands();
-    vkCmdResetQueryPool(commands, pool, 0, 2);
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+    context.resetTimestamps(commands, pool, 2);
+    context.writeTimestamp(commands, pool, 0, true);
     for (int i = 0; i < 400; ++i) kernels.quantize(commands, tiny, tinyOut);
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1);
+    context.writeTimestamp(commands, pool, 1, false);
     context.endAndSubmit(commands, true);
     std::vector<double> stamps = context.readTimestampsMs(pool, 2);
     printf("400 trivial dispatches + barriers: %.3f ms (%.2f us each)\n", stamps[1] - stamps[0], (stamps[1] - stamps[0]) * 2.5);
-    vkDestroyQueryPool(context.device(), pool, nullptr);
+    context.destroyTimestampPool(pool);
     context.destroyBuffer(tiny.buffer); context.destroyBuffer(tinyOut.buffer);
     context.resetDescriptorPool();
   }

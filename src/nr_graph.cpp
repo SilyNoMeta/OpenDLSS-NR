@@ -140,12 +140,12 @@ Graph::Routes Graph::routesFromEnvironment() {
   return r;
 }
 
-Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options)
+Graph::Graph(exec::Device& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options)
     : routes_(routesFromEnvironment()), context_(context), model_(model), kernels_(kernels), geometry_(geometry),
       options_(options) {
   // The compatibility backend has no fused kernel (they are cooperative-matrix GLSL or PTX); sm86 runs the fused
   // PTX blocks, lowered.
-  if (context_.backend() == vk::Backend::Compat) {
+  if (context_.backend() == exec::Backend::Compat) {
     options_.fusedBlocks = false;
     routes_.fusePre = routes_.fusePool = routes_.fuseUpres = routes_.fusePost = false;
   }
@@ -191,7 +191,7 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   activation->channels = channels;
   activation->allocRows = alignRows(rows);
   activation->label = label;
-  VkDeviceSize bytes = (VkDeviceSize)activation->allocRows * channels * formatBytes(format);
+  exec::Size bytes = (exec::Size)activation->allocRows * channels * formatBytes(format);
   activation->buffer = context_.createBuffer(bytes, false, activation->label.c_str());
   context_.fillZero(activation->buffer);
   activations_.push_back(std::move(activation));
@@ -213,7 +213,7 @@ const std::vector<std::string>& Graph::referenceBoundaryNames() {
   return names;
 }
 
-void Graph::capture(VkCommandBuffer commands, const std::string& name, const Activation& source) {
+void Graph::capture(exec::Commands commands, const std::string& name, const Activation& source) {
   if (!options_.captureBoundaries) return;
   // Intra-block tensors ("block-N/qkv"): every block, or only the one DLSS5VK_CAPTURE_BLOCK names (a diagnostic,
   // to compare one block's steps against another implementation without copying them all).
@@ -221,9 +221,8 @@ void Graph::capture(VkCommandBuffer commands, const std::string& name, const Act
   const size_t slash = name.find('/');
   if (slash != std::string::npos && onlyBlock && name.substr(0, slash) != std::string("block-") + onlyBlock) return;
   Activation* copy = allocate("boundary " + name, source.rows, source.channels, source.format);
-  VkBufferCopy region{0, 0, source.validBytes()};
   context_.transferBarrier(commands);
-  vkCmdCopyBuffer(commands, source.buffer.buffer, copy->buffer.buffer, 1, &region);
+  context_.copyBuffer(commands, source.buffer, copy->buffer, source.validBytes());
   context_.transferBarrier(commands);
   boundaries_[name] = copy;
 }
@@ -270,7 +269,7 @@ void Graph::chainBlock32(Kernels::FusedBlock32Args& f, int block, uint32_t waitS
 }
 
 // encodeFusedBlock: FFN (dense 32 or C/32 experts) -> QKV -> window attention -> projection.
-void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const Activation& state,
+void Graph::encodeFusedBlock(exec::Commands commands, Temporaries& temps, const Activation& state,
                              Activation* output, int block, uint32_t channels, uint32_t width, uint32_t height,
                              uint32_t phase, const FusedLayout& layout, const Tensor& tensor,
                              const Activation* ffnSkipOverride, Activation* rawOutput, Activation* pooledOutput,
@@ -324,7 +323,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
     const uint32_t experts = layout.expertCount;
     const uint32_t w2Base = layout.expand + experts * channels * 128;
     const uint32_t w3Base = w2Base + experts * 128 * 32;
-    const vk::Buffer& w1Weights = model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
+    const exec::Buffer& w1Weights = model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
     if (options_.fusedBlocks && !options_.captureIntermediates && kernels_.ptxFfnEnabled() && channels <= 256) {
       // PTX expert FFN + W3 in one kernel (ffn_e4m3.py): every expert of a row group in one workgroup.
       if (ffnSkipOverride) throw std::runtime_error("PTX expert FFN assumes the block state is the FFN skip");
@@ -370,7 +369,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
         mlp.w2 = &model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128);
         kernels_.mlpPtx(commands, mlp);
       } else {
-        const vk::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128, false);
+        const exec::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128, false);
         mlp.w1 = &w1Weights; mlp.w2 = &w2Weights;
         kernels_.gemmMlp(commands, mlp);
       }
@@ -381,7 +380,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
       w3.residual = residual; w3.scaleResidual = true; w3.auxTensor = &tensor; w3.auxByteOffset = layout.ffnCosSkip;
       kernels_.gemmFp8(commands, w3);
     } else {
-      const vk::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128);
+      const exec::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128);
       GemmFp8Args w1;
       w1.input = &state; w1.rows = rows; w1.K = channels; w1.N = 128; w1.batches = experts; w1.broadcastInput = true;
       w1.weights = &w1Weights; w1.Nmatrix = 128;
@@ -423,7 +422,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
   }
   uint32_t shiftX, shiftY;
   windowPhase(phase, shiftX, shiftY);
-  const vk::Buffer& qkvWeights = model_.fp8Matrix(tensor, layout.qkv, channels, channels * 3);
+  const exec::Buffer& qkvWeights = model_.fp8Matrix(tensor, layout.qkv, channels, channels * 3);
   if (options_.fusedBlocks && !options_.captureIntermediates) {
     // The raw half QKV never leaves the SM: projection + normalize + attention per (window, head).
     Kernels::Chain qc;
@@ -481,7 +480,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
 // encodeSplitBlock: eight independent 512 -> 64 -> 256 -> 64 FFN branches
 // (SiLU after the 256-wide middle only), concatenated and contracted, then
 // 16-head window attention. Every inter-GEMM boundary is E4M3.
-void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, const Activation& state,
+void Graph::encodeSplitBlock(exec::Commands commands, SplitTemporaries& temps, const Activation& state,
                              Activation* output, int block, uint32_t width, uint32_t height, uint32_t phase,
                              Activation* rawOutput, bool firstInStage, bool lastInStage) {
   const uint32_t rows = width * height;
@@ -518,19 +517,19 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
   // The fused branch MLP is cooperative-matrix GLSL only (no PTX twin): without FP8 cooperative matrices (sm86) the
   // branches run as two batched GEMMs.
   if (options_.fusedBlocks && !options_.captureIntermediates && context_.nativeFp8()) {
-    const vk::Buffer& w2Weights =
+    const exec::Buffer& w2Weights =
         model_.fp8Matrix(branchTensor, w2Base, branches * branchChannels, middleChannels, true, branchChannels);
     // Fused MLP: W3 N-major per branch ([branch][64 n][256 k]).
-    const vk::Buffer& w3Weights =
+    const exec::Buffer& w3Weights =
         model_.fp8Matrix(branchTensor, w3Base, branches * middleChannels, branchChannels, true, middleChannels, false);
     Kernels::MlpArgs mlp;
     mlp.input = temps.branch; mlp.w1 = &w2Weights; mlp.w2 = &w3Weights; mlp.output = temps.layer0;
     mlp.rows = rows; mlp.K = branchChannels; mlp.hidden = middleChannels; mlp.nout = branchChannels; mlp.batches = branches;
     kernels_.gemmMlp(commands, mlp);
   } else {
-    const vk::Buffer& w2Weights =
+    const exec::Buffer& w2Weights =
         model_.fp8Matrix(branchTensor, w2Base, branches * branchChannels, middleChannels, true, branchChannels);
-    const vk::Buffer& w3Weights =
+    const exec::Buffer& w3Weights =
         model_.fp8Matrix(branchTensor, w3Base, branches * middleChannels, branchChannels, true, middleChannels);
     if (options_.fusedBlocks && !options_.captureIntermediates && kernels_.ptxGemmEnabled()) {
       // No batched PTX GEMM: one single-batch GEMM per branch (its weights a tile-major block of K x N bytes), so the
@@ -574,7 +573,7 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
   uint32_t shiftX, shiftY;
   windowPhase(phase, shiftX, shiftY);
   std::string prefix = "block-" + std::to_string(block) + "/";
-  const vk::Buffer& qkvWeights = model_.fp8Matrix(qkvTensor, 0, channels, channels * 3);
+  const exec::Buffer& qkvWeights = model_.fp8Matrix(qkvTensor, 0, channels, channels * 3);
   if (options_.fusedBlocks && !options_.captureIntermediates) {
     Kernels::Chain qc;
     if (chain && (splitChain & 1)) { qc.waitBands = kernels_.syncAddress(block, Kernels::kSyncBands); qc.waitMul = channels / 64; }
@@ -614,7 +613,7 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
 }
 
 // Global ViT: eight 1024-channel blocks over the coarsest tokens.
-void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t tokens) {
+void Graph::encodeVit(exec::Commands commands, Activation& state, uint32_t tokens) {
   const uint32_t channels = 1024, heads = 32, ffnChannels = 4096;
   const uint32_t padded = geometry_.paddedVitTokens();
   Activation* expanded = allocate("ViT FFN 4096", tokens, ffnChannels, Format::E4);
@@ -701,7 +700,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
   }
 }
 
-void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+void Graph::record(exec::Commands commands, const Activation& inputFeatures) {
   kernels_.resetDispatchCount();
   kernels_.resetSync(commands);   // chaining and split-K tile counters
   const Geometry& g = geometry_;
@@ -726,7 +725,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   if (options_.fusedBlocks && !options_.captureIntermediates && fusePre) {
     // The f32 -> f16 conversion and the 16 -> 32 input adapter run inside block 0 (register-resident skip / state).
     uint32_t paddedN = 0;
-    const vk::Buffer& adapterWeights = model_.f16Matrix(preTensor, preLayout.inputAdapter, 16, 32, paddedN);
+    const exec::Buffer& adapterWeights = model_.f16Matrix(preTensor, preLayout.inputAdapter, 16, 32, paddedN);
     uint32_t shiftX, shiftY;
     windowPhase(takeWindowPhase(kFullLevel), shiftX, shiftY);
     kernels_.setStageLabel("block 0 c32");
@@ -991,7 +990,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       // The post blend (2x upsample of block 69 + block 0, learned scales) feeds block 70 in registers and the
       // RGBA head runs in its epilogue: the frame's last full-resolution round trips disappear.
       uint32_t paddedN = 0;
-      const vk::Buffer& headWeights = model_.f16Matrix(tensor, layout.postWeights, 32, 4, paddedN);
+      const exec::Buffer& headWeights = model_.f16Matrix(tensor, layout.postWeights, 32, 4, paddedN);
       uint32_t shiftX, shiftY;
       windowPhase(takeWindowPhase(kFullLevel), shiftX, shiftY);
       kernels_.setStageLabel("block 70 c32");

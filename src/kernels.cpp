@@ -11,7 +11,7 @@ namespace nr {
 namespace {
 constexpr uint32_t F_RESIDUAL = 1, F_SCALE_RESIDUAL = 2, F_SILU = 8, F_QUANTIZE = 16,
                    F_DUAL = 32, F_RESIDUAL_E4 = 64, F_BROADCAST_INPUT = 128, F_OUT_F32 = 256;
-// What the backend offers (vk::Context::backend): FP8 cooperative matrices and conversions in GLSL (native only), and
+// What the backend offers (exec::Device::backend): FP8 cooperative matrices and conversions in GLSL (native only), and
 // PTX launches (native: the generated kernels; sm86: the same kernels lowered by scripts/ptx/lower_sm86.py). The
 // compatibility GLSL twins stand in for whatever the backend lacks.
 
@@ -42,14 +42,16 @@ void check(bool condition, const char* message) {
 }
 }  // namespace
 
-Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
+Kernels::Kernels(exec::Device& context, const std::string& shaderDirectory) : context_(context) {
   nativeFp8_ = context.nativeFp8();
   ptx_ = context.ptxKernels();
-  const bool sm86 = context.backend() == vk::Backend::Sm86;
+  const bool sm86 = context.backend() == exec::Backend::Sm86;
   ptxDirectory_ = getenv("DLSS5VK_PTX_DIR") ? getenv("DLSS5VK_PTX_DIR") : shaderDirectory + (sm86 ? "/../ptx_sm86" : "/../ptx");
   // Counter chaining relies on the hardware scheduling the producer workgroups before their consumers spin; on the
   // sm86 route it stays off until asked for (DLSS5VK_CHAIN=1), the launches being separated by barriers.
   chainEnabled_ = getenv("DLSS5VK_CHAIN") ? atoi(getenv("DLSS5VK_CHAIN")) != 0 : !sm86;
+  // Chaining needs the status word the kernels write to be host-visible: an adapter without it keeps the barriers.
+  if (!context_.chainSupported()) chainEnabled_ = false;
   modules_["preprocess"] = context_.loadShaderModule(shaderDirectory + "/preprocess.spv");
   // The kernels that use FP8 hardware (cooperative matrices or E4M3 conversions) or an approximation the GLSL
   // compiler may relax (the norms) have a compatibility twin with the same arithmetic in exact software; the native
@@ -71,7 +73,7 @@ Kernels::~Kernels() {
     context_.destroyCudaFunction(kernel.function);
     context_.destroyCudaModule(kernel.module);
   }
-  if (profileQueries_) vkDestroyQueryPool(context_.device(), profileQueries_, nullptr);
+  if (profileQueries_) context_.destroyTimestampPool(profileQueries_);
   context_.destroyBuffer(siluTable_);
   context_.destroyBuffer(syncBuffer_);
   context_.destroyBuffer(chainStatus_);
@@ -84,25 +86,25 @@ void Kernels::setSiluTable(const std::vector<uint16_t>& table) {
   context_.upload(siluTable_, table.data(), 65536 * 2);
 }
 
-VkPipeline Kernels::pipeline(const char* shader, const vk::SpecConstants& constants, uint32_t requiredSubgroupSize) {
+exec::PipelineHandle Kernels::pipeline(const char* shader, const exec::SpecConstants& constants, uint32_t requiredSubgroupSize) {
   if (!modules_.count(shader))
     throw std::runtime_error(std::string("the GLSL kernel ") + shader + " needs FP8 cooperative matrices, which the " +
-                             vk::backendName(context_.backend()) + " backend does not have (a PTX route switched off?)");
+                             exec::backendName(context_.backend()) + " backend does not have (a PTX route switched off?)");
   std::string key = shader;
   for (uint32_t value : constants.data) key += ":" + std::to_string(value);
   auto it = pipelines_.find(key);
   if (it != pipelines_.end()) return it->second.pipeline;
-  vk::Pipeline created = context_.createComputePipeline(modules_.at(shader), constants, shader, requiredSubgroupSize);
+  exec::Pipeline created = context_.createComputePipeline(modules_.at(shader), constants, shader, requiredSubgroupSize);
   pipelines_[key] = created;
   return created.pipeline;
 }
 
-void Kernels::beginProfile(VkCommandBuffer commands, uint32_t maxDispatches) {
-  if (profileQueries_) vkDestroyQueryPool(context_.device(), profileQueries_, nullptr);
+void Kernels::beginProfile(exec::Commands commands, uint32_t maxDispatches) {
+  if (profileQueries_) context_.destroyTimestampPool(profileQueries_);
   profileCapacity_ = maxDispatches + 1;
   profileQueries_ = context_.createTimestampPool(profileCapacity_);
-  vkCmdResetQueryPool(commands, profileQueries_, 0, profileCapacity_);
-  vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, profileQueries_, 0);
+  context_.resetTimestamps(commands, profileQueries_, profileCapacity_);
+  context_.writeTimestamp(commands, profileQueries_, 0, true);
   profileCount_ = 1;
   profileLabels_.clear();
   dispatches_ = 0;
@@ -113,22 +115,18 @@ std::vector<Kernels::ProfileEntry> Kernels::endProfile() {
   if (!profileQueries_) return entries;
   std::vector<double> stamps = context_.readTimestampsMs(profileQueries_, profileCount_);
   for (uint32_t i = 1; i < profileCount_; ++i) entries.push_back({profileLabels_[i - 1], stamps[i] - stamps[i - 1]});
-  vkDestroyQueryPool(context_.device(), profileQueries_, nullptr);
-  profileQueries_ = VK_NULL_HANDLE;
+  context_.destroyTimestampPool(profileQueries_);
+  profileQueries_ = nullptr;
   return entries;
 }
 
-void Kernels::dispatch(VkCommandBuffer commands, VkPipeline pipeline,
-                       const vk::Buffer* const bindings[vk::kGenericBindings], const void* push, uint32_t pushBytes,
+void Kernels::dispatch(exec::Commands commands, exec::PipelineHandle pipeline,
+                       const exec::Buffer* const bindings[exec::kGenericBindings], const void* push, uint32_t pushBytes,
                        uint32_t x, uint32_t y, uint32_t z) {
-  VkDescriptorSet set = context_.allocateSet(bindings);
-  vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, context_.pipelineLayout(), 0, 1, &set, 0, nullptr);
-  vkCmdPushConstants(commands, context_.pipelineLayout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pushBytes, push);
-  vkCmdDispatch(commands, x, y, z);
+  context_.dispatch(commands, pipeline, bindings, push, pushBytes, x, y, z);
   context_.computeBarrier(commands);
   if (profileQueries_ && profileCount_ < profileCapacity_) {
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profileQueries_, profileCount_++);
+    context_.writeTimestamp(commands, profileQueries_, profileCount_++, false);
     profileLabels_.push_back(stageLabel_ + " | " + dispatchLabel_);
   }
   ++dispatches_;
@@ -137,36 +135,36 @@ void Kernels::dispatch(VkCommandBuffer commands, VkPipeline pipeline,
 bool Kernels::chainEnabled() const { return chainEnabled_; }
 void Kernels::setChainEnabled(bool on) { chainEnabled_ = on; }
 
-VkDeviceAddress Kernels::syncAddress(int block, SyncRegion region) {
-  if (syncBuffer_.buffer == VK_NULL_HANDLE) { syncBuffer_ = context_.createBuffer((VkDeviceSize)kSyncSlots * kSyncSlotBytes, false, "sync counters"); context_.fillZero(syncBuffer_); }
+exec::Address Kernels::syncAddress(int block, SyncRegion region) {
+  if (syncBuffer_.buffer == nullptr) { syncBuffer_ = context_.createBuffer((exec::Size)kSyncSlots * kSyncSlotBytes, false, "sync counters"); context_.fillZero(syncBuffer_); }
   check(block >= 0 && (uint32_t)block < kSyncSlots, "sync slot");
-  return context_.deviceAddress(syncBuffer_) + (VkDeviceSize)block * kSyncSlotBytes + (VkDeviceSize)region * kSyncRegionBytes;
+  return context_.deviceAddress(syncBuffer_) + (exec::Size)block * kSyncSlotBytes + (exec::Size)region * kSyncRegionBytes;
 }
 
-VkDeviceAddress Kernels::tileCounters(uint32_t count) {
+exec::Address Kernels::tileCounters(uint32_t count) {
   const uint32_t bytes = (count * 4 + 15) & ~15u;
   check(tileCounterCursor_ + bytes <= (kSyncSlots - kTileCounterSlot) * kSyncSlotBytes, "tile counters exhausted (per frame)");
-  VkDeviceAddress address = syncAddress(kTileCounterSlot, kSyncBands) + tileCounterCursor_;
+  exec::Address address = syncAddress(kTileCounterSlot, kSyncBands) + tileCounterCursor_;
   tileCounterCursor_ += bytes;
   return address;
 }
 
 // Consumers spin on these. A stale count starts one early.
-void Kernels::resetSync(VkCommandBuffer commands) {
-  if (syncBuffer_.buffer == VK_NULL_HANDLE) syncAddress(0, kSyncBands);
-  vkCmdFillBuffer(commands, syncBuffer_.buffer, 0, VK_WHOLE_SIZE, 0);
+void Kernels::resetSync(exec::Commands commands) {
+  if (syncBuffer_.buffer == nullptr) syncAddress(0, kSyncBands);
+  context_.zeroBuffer(commands, syncBuffer_);
   context_.transferBarrier(commands);
   chainLaunches_.clear();
 }
 
-void Kernels::noteChain(VkDeviceAddress waitA, VkDeviceAddress waitB, VkDeviceAddress signal) {
+void Kernels::noteChain(exec::Address waitA, exec::Address waitB, exec::Address signal) {
   if (waitA || waitB || signal) chainLaunches_.push_back({stageLabel_ + " | " + dispatchLabel_, {waitA, waitB}, signal});
 }
 
 void Kernels::checkChainOrder() const {
   for (size_t i = 0; i < chainLaunches_.size(); ++i) {
     const ChainLaunch& launch = chainLaunches_[i];
-    for (VkDeviceAddress wait : launch.waits) {
+    for (exec::Address wait : launch.waits) {
       if (!wait) continue;
       if (wait == launch.signal) throw std::runtime_error("chain order: " + launch.label + " waits on the counters it signals");
       bool signalledBefore = false;
@@ -176,8 +174,8 @@ void Kernels::checkChainOrder() const {
   }
 }
 
-VkDeviceAddress Kernels::chainStatusAddress() {
-  if (chainStatus_.buffer == VK_NULL_HANDLE) {
+exec::Address Kernels::chainStatusAddress() {
+  if (chainStatus_.buffer == nullptr) {
     chainStatus_ = context_.createBuffer(16, true, "chain status");
     memset(chainStatus_.mapped, 0, 16);
   }
@@ -204,20 +202,20 @@ void Kernels::resetChainTimeouts() {
   if (chainStatus_.mapped) memset(chainStatus_.mapped, 0, 16);
 }
 
-void Kernels::cudaLaunchTracked(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY,
+void Kernels::cudaLaunchTracked(exec::Commands commands, exec::Kernel function, uint32_t gridX, uint32_t gridY,
                                 uint32_t gridZ, uint32_t blockX, uint32_t sharedBytes, const void* const* params,
                                 size_t paramCount, bool chained) {
   context_.cudaLaunch(commands, function, gridX, gridY, gridZ, blockX, sharedBytes, params, paramCount);
   if (!(chained && chainEnabled_)) context_.computeBarrier(commands);
   if (profileQueries_ && profileCount_ < profileCapacity_) {
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profileQueries_, profileCount_++);
+    context_.writeTimestamp(commands, profileQueries_, profileCount_++, false);
     profileLabels_.push_back(stageLabel_ + " | " + dispatchLabel_);
   }
   ++dispatches_;
 }
 
-void Kernels::dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
-                             const vk::Buffer* const bindings[vk::kGenericBindings], const void* push,
+void Kernels::dispatchLinear(exec::Commands commands, exec::PipelineHandle pipeline,
+                             const exec::Buffer* const bindings[exec::kGenericBindings], const void* push,
                              uint32_t pushBytes, uint32_t count) {
   uint32_t groups = (count + 255) / 256;
   uint32_t y = (groups + 65534) / 65535;
@@ -235,7 +233,7 @@ bool Kernels::ptxQkvEnabled() const {
 }
 
 // gemm_fp8_compat.comp: the exact software GEMM (partitions included), for GPUs without FP8 cooperative matrices.
-void Kernels::gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& a) {
+void Kernels::gemmFp8Compat(exec::Commands commands, const GemmFp8Args& a) {
   check(a.weightByteOffset == 0, "the compatibility GEMM takes no weight offset");
   uint32_t flags = (a.residual ? F_RESIDUAL : 0) | (a.scaleResidual ? F_SCALE_RESIDUAL : 0) |
                    (a.silu ? F_SILU : 0) | (a.quantize ? F_QUANTIZE : 0) |
@@ -243,7 +241,7 @@ void Kernels::gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& a) {
                    (a.residual && a.residual->format == Format::E4 ? F_RESIDUAL_E4 : 0) |
                    (a.broadcastInput ? F_BROADCAST_INPUT : 0);
   check(!a.scaleResidual || a.auxTensor, "scaled residual needs an aux tensor");
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, a.K);
   constants.add(2, flags);
   constants.add(3, a.partition);
@@ -252,7 +250,7 @@ void Kernels::gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& a) {
         auxHalfOffset, batches;
   } push{a.rows, a.N, a.Nmatrix, a.weightColumnOffset, a.input->channels, a.inputColumnBase, a.output->channels,
          a.outputColumnOffset, a.auxByteOffset / 2, a.batches};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &a.input->buffer;
   bindings[1] = a.weights;
   if (!a.quantize) bindings[2] = &a.output->buffer;
@@ -268,7 +266,7 @@ void Kernels::gemmFp8Compat(VkCommandBuffer commands, const GemmFp8Args& a) {
            (a.N + 63) / 64, a.batches);
 }
 
-void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+void Kernels::gemmFp8(exec::Commands commands, const GemmFp8Args& a) {
   check(a.input && a.input->format == Format::E4, "FP8 GEMM input must be E4M3");
   check(a.K % 32 == 0, "FP8 GEMM K must be a multiple of 32");
   check(a.output, "FP8 GEMM needs an output");
@@ -291,7 +289,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   static const int splitEnv = getenv("DLSS5VK_SPLITK") ? atoi(getenv("DLSS5VK_SPLITK")) : -1;   // -1 auto, 0 off, K value: only that K
   if (a.partition && a.K > a.partition && a.batches == 1 &&
       ((a.rows + 63) / 64) * std::max(1u, a.N / 64) < 2 * context_.smCount() && splitEnv != 0 && (splitEnv <= 0 || (uint32_t)splitEnv == a.K) &&
-      (VkDeviceSize)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
+      (exec::Size)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
     splits = a.K / a.partition;
   // PTX GEMM (scripts/ptx/gemm2_e4m3.py): the expert-stage shapes (single batch, N % 64 == 0, no partition,
   // residual seeded from an E4 tensor with a scale, E4 / f16 / dual outputs, optional SiLU).
@@ -311,28 +309,28 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     const std::string entry = "gemmv_e4m3_K" + std::to_string(a.K) + "_f" + std::to_string(vflags) + "_s" + std::to_string(vsplits) +
                               (bm != 192 ? "_m" + std::to_string(bm) : "");
     std::ifstream probe(ptxDirectory_ + "/" + entry + ".ptx");
-    const VkDeviceSize partialBytes = (VkDeviceSize)vsplits * rowGroups * colGroups * warps * 48 * 128;   // fragment-order slices
+    const exec::Size partialBytes = (exec::Size)vsplits * rowGroups * colGroups * warps * 48 * 128;   // fragment-order slices
     if (probe.good() && rowGroups <= 65535) {
       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-      if (vsplits > 1 && splitScratch_.buffer == VK_NULL_HANDLE) {
+      if (vsplits > 1 && splitScratch_.buffer == nullptr) {
         // sized once (launches already recorded hold its address): four times the first split shape covers the
         // widest ViT GEMM of the same token count (qkv: 24 column groups x 2 splits vs the contract's 8 x 4)
-        splitScratchBytes_ = std::max<VkDeviceSize>(16u << 20, 4 * partialBytes);
+        splitScratchBytes_ = std::max<exec::Size>(16u << 20, 4 * partialBytes);
         splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials");
       }
       check(vsplits == 1 || partialBytes <= splitScratchBytes_, "split-K partials exceed the scratch buffer (gemmv)");
-      VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights);
-      VkDeviceAddress pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
-      VkDeviceAddress pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
-      VkDeviceAddress pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
-      VkDeviceAddress pOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
-      VkDeviceAddress pPartial = vsplits > 1 ? context_.deviceAddress(splitScratch_) : pA;
-      VkDeviceAddress pCount = vsplits > 1 ? tileCounters(rowGroups * colGroups) : pA;
-      VkDeviceAddress pWait = a.chainWaitRows, pSignal = a.chainSignal;
+      exec::Address pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights);
+      exec::Address pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
+      exec::Address pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
+      exec::Address pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
+      exec::Address pOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
+      exec::Address pPartial = vsplits > 1 ? context_.deviceAddress(splitScratch_) : pA;
+      exec::Address pCount = vsplits > 1 ? tileCounters(rowGroups * colGroups) : pA;
+      exec::Address pWait = a.chainWaitRows, pSignal = a.chainSignal;
       uint32_t rows = a.rows, inputStride = a.input->channels, inputColumnBase = a.inputColumnBase, Nmatrix = a.Nmatrix,
                weightColumnOffset = a.weightColumnOffset, outputStride = a.output->channels, outputColumnOffset = a.outputColumnOffset,
                auxHalfOffset = a.auxByteOffset / 2, waitExpected = a.chainWaitExpected;
-      VkDeviceAddress pError = chainStatusAddress();
+      exec::Address pError = chainStatusAddress();
       const void* params[] = {&pA, &pW, &pRes, &pAux, &pOut, &pOut16, &pPartial, &pCount, &rows, &inputStride, &inputColumnBase, &Nmatrix,
                               &weightColumnOffset, &outputStride, &outputColumnOffset, &auxHalfOffset, &pWait, &waitExpected, &pSignal, &pError};
       check(kernel.dynamicShared, "gemmv PTX without a dynamic_shared size");
@@ -353,7 +351,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     const uint32_t rowGroups = (a.rows + 191) / 192, colGroups = a.N / 64;
     uint32_t tsplits = 1;
     if (a.partition && a.K > a.partition && rowGroups * colGroups < 2 * context_.smCount() && splitEnv != 0 &&
-        (VkDeviceSize)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
+        (exec::Size)(a.K / a.partition) * alignRows(a.rows) * a.N * 2 <= (16u << 20))
       tsplits = a.K / a.partition;
     const uint32_t outFlags = (a.silu ? 2u : 0u) | ((a.quantize || a.dualOutput) ? 4u : 0u) | (a.quantize ? 0u : 8u);
     const uint32_t gflags = (a.residual ? 1u : 0u) | (tsplits == 1 ? outFlags : 0u);
@@ -366,14 +364,14 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
       const uint32_t splitStride = alignRows(a.rows) * a.N;
       if (tsplits > 1) {
-        if (splitScratch_.buffer == VK_NULL_HANDLE) { splitScratchBytes_ = 16u << 20; splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials"); }
-        check((VkDeviceSize)tsplits * splitStride * 2 <= splitScratchBytes_, "split-K partials exceed the scratch buffer");
+        if (splitScratch_.buffer == nullptr) { splitScratchBytes_ = 16u << 20; splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials"); }
+        check((exec::Size)tsplits * splitStride * 2 <= splitScratchBytes_, "split-K partials exceed the scratch buffer");
       }
-      VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights);
-      VkDeviceAddress pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
-      VkDeviceAddress pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
-      VkDeviceAddress pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
-      VkDeviceAddress pOut16 = tsplits > 1 ? context_.deviceAddress(splitScratch_) : a.quantize ? pA : context_.deviceAddress(a.output->buffer);
+      exec::Address pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights);
+      exec::Address pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
+      exec::Address pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
+      exec::Address pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
+      exec::Address pOut16 = tsplits > 1 ? context_.deviceAddress(splitScratch_) : a.quantize ? pA : context_.deviceAddress(a.output->buffer);
       uint32_t rows = a.rows, inputStride = a.input->channels, inputColumnBase = a.inputColumnBase, Nmatrix = a.Nmatrix,
                weightColumnOffset = a.weightColumnOffset, outputStride = tsplits > 1 ? a.N : a.output->channels,
                outputColumnOffset = tsplits > 1 ? 0u : a.outputColumnOffset, auxHalfOffset = a.auxByteOffset / 2, sStride = splitStride;
@@ -388,9 +386,9 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
       if (tsplits > 1) {
         const std::string rentry = "reduce_e4m3_s" + std::to_string(tsplits) + "_f" + std::to_string(outFlags);
         PtxKernel& rkernel = ptxKernel(rentry + ".ptx", rentry);
-        VkDeviceAddress pPartial = context_.deviceAddress(splitScratch_);
-        VkDeviceAddress rOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
-        VkDeviceAddress rOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
+        exec::Address pPartial = context_.deviceAddress(splitScratch_);
+        exec::Address rOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
+        exec::Address rOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
         uint32_t N = a.N, oStride = a.output->channels, oCol = a.outputColumnOffset;
         const void* rparams[] = {&pPartial, &rOut, &rOut16, &rows, &N, &sStride, &oStride, &oCol};
         dispatchLabel_ = "reduce_ptx " + std::to_string(a.rows) + "x" + std::to_string(a.N) + " s" + std::to_string(tsplits);
@@ -406,20 +404,20 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     uint32_t pflags = (a.residual ? 1u : 0u) | (a.silu ? 2u : 0u) | ((a.quantize || a.dualOutput) ? 4u : 0u) | (a.quantize ? 0u : 8u);
     const std::string entry = "gemm2_e4m3_K" + std::to_string(a.K) + "_f" + std::to_string(pflags);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-    VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights) + a.weightByteOffset;
-    VkDeviceAddress pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
-    VkDeviceAddress pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
-    VkDeviceAddress pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
-    VkDeviceAddress pOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
+    exec::Address pA = context_.deviceAddress(a.input->buffer), pW = context_.deviceAddress(*a.weights) + a.weightByteOffset;
+    exec::Address pRes = a.residual ? context_.deviceAddress(a.residual->buffer) : pA;
+    exec::Address pAux = a.auxTensor ? context_.deviceAddress(a.auxTensor->raw) : pA;
+    exec::Address pOut = a.quantize ? context_.deviceAddress(a.output->buffer) : a.dualOutput ? context_.deviceAddress(a.dualOutput->buffer) : pA;
+    exec::Address pOut16 = a.quantize ? pA : context_.deviceAddress(a.output->buffer);
     uint32_t rows = a.rows, inputStride = a.input->channels, inputColumnBase = a.inputColumnBase, Nmatrix = a.Nmatrix,
              weightColumnOffset = a.weightColumnOffset, outputStride = a.output->channels, outputColumnOffset = a.outputColumnOffset,
              auxHalfOffset = a.auxByteOffset / 2;
-    VkDeviceAddress pWaitRows = a.chainWaitRows, pSignal = a.chainSignal, pWaitBands = a.chainWaitBands;
+    exec::Address pWaitRows = a.chainWaitRows, pSignal = a.chainSignal, pWaitBands = a.chainWaitBands;
     uint32_t waitExpected = a.chainWaitExpected, waitShiftY = a.chainWaitShiftY, width = a.chainWidth, waitMul = a.chainWaitMul, waitGroupRows = a.chainWaitGroupRows;
     if ((pWaitRows || pSignal || pWaitBands) && !width)
       throw std::runtime_error("PTX GEMM chaining needs the token row width (" + stageLabel_ + ": " + std::to_string(a.rows) + "x" +
                                std::to_string(a.K) + "->" + std::to_string(a.N) + ")");
-    VkDeviceAddress pError = chainStatusAddress();
+    exec::Address pError = chainStatusAddress();
     const void* params[] = {&pA, &pW, &pRes, &pAux, &pOut, &pOut16, &rows, &inputStride, &inputColumnBase, &Nmatrix,
                             &weightColumnOffset, &outputStride, &outputColumnOffset, &auxHalfOffset,
                             &pWaitRows, &waitExpected, &waitShiftY, &pSignal, &width, &pWaitBands, &waitMul, &waitGroupRows, &pError};
@@ -450,7 +448,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
         "GEMM epilogue needs 16-column aligned outputs");
   const uint32_t publishFlags = flags & (F_SILU | F_QUANTIZE | F_DUAL);
   if (splits > 1) flags &= ~publishFlags;   // publication moves to the reduce pass
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, a.K);
   constants.add(1, tiles);
   constants.add(2, flags);
@@ -477,13 +475,13 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
          a.outputColumnOffset, a.auxByteOffset / 2, a.batches, a.N / tile, splitStride};
   if (splits > 1) {
     // One fixed scratch: it may not be reallocated while recorded dispatches still reference it.
-    if (splitScratch_.buffer == VK_NULL_HANDLE) {
+    if (splitScratch_.buffer == nullptr) {
       splitScratchBytes_ = 16u << 20;
       splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials");
     }
-    check((VkDeviceSize)splits * splitStride * 2 <= splitScratchBytes_, "split-K partials exceed the scratch buffer");
+    check((exec::Size)splits * splitStride * 2 <= splitScratchBytes_, "split-K partials exceed the scratch buffer");
   }
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &a.input->buffer;
   bindings[1] = a.weights;
   if (!a.quantize) bindings[2] = &a.output->buffer;
@@ -503,12 +501,12 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   dispatch(commands, pipeline("gemm_fp8", constants), bindings, &push, sizeof(push), a.batches * (a.N / tile) * splits,
            std::min(rowGroups, 65535u), z);
   if (splits > 1) {
-    vk::SpecConstants reduceConstants;
+    exec::SpecConstants reduceConstants;
     reduceConstants.add(0, splits);
     reduceConstants.add(1, publishFlags);
     struct ReducePush { uint32_t rows, N, splitStride, outputStride, outputColumnOffset; }
         reducePush{a.rows, a.N, splitStride, a.output->channels, a.outputColumnOffset};
-    const vk::Buffer* reduceBindings[vk::kGenericBindings] = {};
+    const exec::Buffer* reduceBindings[exec::kGenericBindings] = {};
     reduceBindings[0] = &splitScratch_;
     if (!a.quantize) reduceBindings[2] = &a.output->buffer;
     if (a.quantize) reduceBindings[5] = &a.output->buffer;
@@ -519,7 +517,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
   }
 }
 
-void Kernels::gemmF16(VkCommandBuffer commands, const GemmF16Args& a) {
+void Kernels::gemmF16(exec::Commands commands, const GemmF16Args& a) {
   check(a.input && a.input->format == Format::F16, "f16 GEMM input must be f16");
   check(a.K % 16 == 0 && a.paddedN % 16 == 0 && a.N <= a.paddedN, "f16 GEMM shape");
   check(a.input->allocRows >= alignRows(a.rows) && a.output->allocRows >= alignRows(a.rows), "f16 GEMM rows");
@@ -527,12 +525,12 @@ void Kernels::gemmF16(VkCommandBuffer commands, const GemmF16Args& a) {
   if (a.output->format == Format::F32) flags |= F_OUT_F32;
   else if (a.output->format == Format::E4) flags |= F_QUANTIZE;
   if (a.dualOutput) flags |= F_DUAL;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, a.K);
   constants.add(1, a.paddedN);
   constants.add(2, flags);
   struct Push { uint32_t rows, N, inputStride, outputStride; } push{a.rows, a.N, a.input->channels, a.output->channels};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &a.input->buffer;
   bindings[1] = a.weights;
   if (a.output->format == Format::F16) bindings[2] = &a.output->buffer;
@@ -555,7 +553,7 @@ struct OpsPush {
 };
 }  // namespace
 
-void Kernels::preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& proxy, Activation& features,
+void Kernels::preprocessFromProxy(exec::Commands commands, const exec::Buffer& proxy, Activation& features,
                                   const PreprocessArgs& a) {
   check(features.format == Format::F32 && features.channels == 16 && features.rows == a.fullWidth * a.fullHeight,
         "preprocess output must be f32 [full][16]");
@@ -564,7 +562,7 @@ void Kernels::preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& pr
     float autoMask, localTone, localStructure, skinStructure, style;
   } push{a.fullWidth, a.fullHeight, a.validWidth, a.validHeight, a.sourceWidth, a.sourceHeight, a.seed,
          a.autoMask ? 1.0f : -1.0f, a.localTone, a.localStructure, a.skinStructure, a.style};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &proxy;
   bindings[7] = &features.buffer;
   dispatchLabel_ = "preprocess";
@@ -572,13 +570,13 @@ void Kernels::preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& pr
            (a.fullHeight + 7) / 8, 1);
 }
 
-void Kernels::convertF32ToF16(VkCommandBuffer commands, const Activation& input, Activation& output) {
+void Kernels::convertF32ToF16(exec::Commands commands, const Activation& input, Activation& output) {
   check(input.format == Format::F32 && output.format == Format::F16, "convert formats");
   uint32_t count = input.rows * input.channels;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, 0);
   OpsPush push{count, input.channels, 0, 0, 0, 0, 0, 0, 0};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &input.buffer;
   bindings[6] = &output.buffer;
   dispatchLabel_ = "convert f32->f16";
@@ -586,13 +584,13 @@ void Kernels::convertF32ToF16(VkCommandBuffer commands, const Activation& input,
   dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
-void Kernels::quantize(VkCommandBuffer commands, const Activation& input, Activation& output) {
+void Kernels::quantize(exec::Commands commands, const Activation& input, Activation& output) {
   check(input.format == Format::F16 && output.format == Format::E4, "quantize formats");
   uint32_t count = input.rows * input.channels;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, 1);
   OpsPush push{count, input.channels, 0, 0, 0, 0, 0, 0, 0};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[1] = &input.buffer;
   bindings[5] = &output.buffer;
   dispatchLabel_ = "quantize";
@@ -600,15 +598,15 @@ void Kernels::quantize(VkCommandBuffer commands, const Activation& input, Activa
   dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
-void Kernels::downsample2x(VkCommandBuffer commands, const Activation& input, Activation& output, uint32_t inWidth,
+void Kernels::downsample2x(exec::Commands commands, const Activation& input, Activation& output, uint32_t inWidth,
                            uint32_t inHeight, uint32_t outWidth, uint32_t outHeight) {
   check(input.format == Format::F16 && output.format == Format::E4, "downsample formats");
   check(input.rows == inWidth * inHeight && output.rows == outWidth * outHeight, "downsample geometry");
   uint32_t count = output.rows * output.channels;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, 2);
   OpsPush push{count, output.channels, inWidth, inHeight, outWidth, outHeight, 0, 0, 0};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[1] = &input.buffer;
   bindings[5] = &output.buffer;
   dispatchLabel_ = "downsample2x";
@@ -616,18 +614,18 @@ void Kernels::downsample2x(VkCommandBuffer commands, const Activation& input, Ac
   dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
-void Kernels::postBlend(VkCommandBuffer commands, const Activation& upsampleSource, const Activation& adapter,
+void Kernels::postBlend(exec::Commands commands, const Activation& upsampleSource, const Activation& adapter,
                         const Tensor& tensor, uint32_t inputScaleByteOffset, uint32_t skipScaleByteOffset,
                         Activation& rawOutput, Activation& quantizedOutput, uint32_t inWidth, uint32_t inHeight,
                         uint32_t outWidth, uint32_t outHeight) {
   check(upsampleSource.format == Format::E4 && adapter.format == Format::E4, "post blend inputs");
   check(rawOutput.format == Format::F16 && quantizedOutput.format == Format::E4, "post blend outputs");
   uint32_t count = quantizedOutput.rows * quantizedOutput.channels;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, 3);
   OpsPush push{count, quantizedOutput.channels, inWidth, inHeight, outWidth, outHeight, inputScaleByteOffset / 2,
                skipScaleByteOffset / 2, 1};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[2] = &upsampleSource.buffer;
   bindings[3] = &adapter.buffer;
   bindings[4] = &tensor.raw;
@@ -638,7 +636,7 @@ void Kernels::postBlend(VkCommandBuffer commands, const Activation& upsampleSour
   dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
-void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& projection, const Activation& skip,
+void Kernels::upsampleResidual(exec::Commands commands, const Activation& projection, const Activation& skip,
                                const Tensor& tensor, uint32_t scaleByteOffset, Activation& output,
                                Activation* rawOutput, uint32_t inWidth, uint32_t inHeight, uint32_t outWidth,
                                uint32_t outHeight) {
@@ -647,11 +645,11 @@ void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& proje
   check(!rawOutput || rawOutput->format == Format::F16, "upsample residual raw output");
   check(projection.rows == inWidth * inHeight && output.rows == outWidth * outHeight, "upsample residual geometry");
   uint32_t count = output.rows * output.channels;
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, 4);
   OpsPush push{count, output.channels, inWidth, inHeight, outWidth, outHeight, scaleByteOffset / 2, 0,
                rawOutput ? 1u : 0u};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[1] = &projection.buffer;
   bindings[3] = &skip.buffer;
   bindings[4] = &tensor.raw;
@@ -685,7 +683,7 @@ bool Kernels::ptxBlock32Enabled() const {
   return ptx_ && enabled;
 }
 
-void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& a) {
+void Kernels::fusedBlock32Ptx(exec::Commands commands, const FusedBlock32Args& a) {
   check(a.w1Ptx && a.w2Ptx, "PTX fused block needs the permuted / tiled weights");
   check(!a.skip16 && !a.outF16, "PTX fused block: f16 skip / raw output variants are not generated");
   uint32_t flags = (a.outE4 ? 2u : 0u) | (a.features ? 8u : 0u) | (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) |
@@ -694,21 +692,21 @@ void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& 
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
   uint32_t windowsX = (a.width + a.shiftX + 7) / 8, windowsY = (a.height + a.shiftY + 7) / 8;
   uint32_t windows = windowsX * windowsY;
-  VkDeviceAddress pState = context_.deviceAddress(a.features ? a.features->buffer : a.state->buffer);
-  VkDeviceAddress pLow = a.lowRes ? context_.deviceAddress(a.lowRes->buffer)
+  exec::Address pState = context_.deviceAddress(a.features ? a.features->buffer : a.state->buffer);
+  exec::Address pLow = a.lowRes ? context_.deviceAddress(a.lowRes->buffer)
                        : a.lowProjection ? context_.deviceAddress(a.lowProjection->buffer) : pState;
-  VkDeviceAddress pW1 = context_.deviceAddress(*a.w1Ptx), pW2 = context_.deviceAddress(*a.w2Ptx),
+  exec::Address pW1 = context_.deviceAddress(*a.w1Ptx), pW2 = context_.deviceAddress(*a.w2Ptx),
                   pWqkv = context_.deviceAddress(*a.wqkv), pWproj = context_.deviceAddress(*a.wproj),
                   pAux = context_.deviceAddress(a.tensor->raw), pPrior = context_.deviceAddress(*a.prior);
-  VkDeviceAddress pOutE4 = a.outE4 ? context_.deviceAddress(a.outE4->buffer) : pState;
-  VkDeviceAddress pOut2 = a.pooled ? context_.deviceAddress(a.pooled->buffer) : a.head ? context_.deviceAddress(a.head->buffer) : pState;
-  VkDeviceAddress pWf16 = a.features ? context_.deviceAddress(*a.adapterWeights) : a.head ? context_.deviceAddress(*a.headWeights) : pState;
+  exec::Address pOutE4 = a.outE4 ? context_.deviceAddress(a.outE4->buffer) : pState;
+  exec::Address pOut2 = a.pooled ? context_.deviceAddress(a.pooled->buffer) : a.head ? context_.deviceAddress(a.head->buffer) : pState;
+  exec::Address pWf16 = a.features ? context_.deviceAddress(*a.adapterWeights) : a.head ? context_.deviceAddress(*a.headWeights) : pState;
   uint32_t width = a.width, height = a.height, shiftX = a.shiftX, shiftY = a.shiftY, auxFfnHalf = a.ffnScaleByteOffset / 2,
            auxAttnHalf = a.attnScaleByteOffset / 2, scaleWord = a.attentionScaleByteOffset / 4, auxInputHalf = a.inputScaleByteOffset / 2,
            auxAdapterHalf = a.adapterScaleByteOffset / 2, lowWidth = a.pooled ? a.pooledWidth : a.lowWidth;
-  VkDeviceAddress pWait = a.chainWait, pSignal = a.chainSignal;
+  exec::Address pWait = a.chainWait, pSignal = a.chainSignal;
   uint32_t waitExpected = a.chainWaitExpected, waitShiftY = a.chainWaitShiftY, waitScale = a.chainWaitScale;
-  VkDeviceAddress pError = chainStatusAddress();
+  exec::Address pError = chainStatusAddress();
   const void* params[] = {&pState, &pLow, &pW1, &pW2, &pWqkv, &pWproj, &pAux, &pPrior, &pOutE4, &pOut2, &pWf16,
                           &width, &height, &shiftX, &shiftY, &windowsX, &windows, &auxFfnHalf, &auxAttnHalf, &scaleWord,
                           &auxInputHalf, &auxAdapterHalf, &lowWidth, &pWait, &waitExpected, &waitShiftY, &waitScale, &pSignal, &pError};
@@ -724,7 +722,7 @@ bool Kernels::fusedBlock32IsPtx(const FusedBlock32Args& a) const {
   return ptxBlock32Enabled() && a.w1Ptx && a.w2Ptx && !a.skip16 && !a.outF16;
 }
 
-void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) {
+void Kernels::fusedBlock32(exec::Commands commands, const FusedBlock32Args& a) {
   if (fusedBlock32IsPtx(a)) { fusedBlock32Ptx(commands, a); return; }
   check(!a.chainWait && !a.chainSignal && !a.chained, "the GLSL fused block does not implement counter chaining");
   check(a.features || (a.state && a.state->format == Format::E4 && a.state->channels == 32), "fused block state");
@@ -736,7 +734,7 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) 
   check(a.ffnScaleByteOffset % 16 == 0 && a.attnScaleByteOffset % 16 == 0, "fused block scale vectors must be 16-byte aligned");
   uint32_t flags = (a.skip16 ? 1u : 0u) | (a.outE4 ? 2u : 0u) | (a.outF16 ? 4u : 0u) | (a.features ? 8u : 0u) |
                    (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) | (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u);
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, flags);
   uint32_t windowsX = (a.width + a.shiftX + 7) / 8, windowsY = (a.height + a.shiftY + 7) / 8;
   uint32_t windows = windowsX * windowsY;
@@ -746,7 +744,7 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) 
   } push{a.width, a.height, a.shiftX, a.shiftY, windowsX, windows, 0u, a.ffnScaleByteOffset / 2, a.attnScaleByteOffset / 2,
          a.attentionScaleByteOffset / 4, a.inputScaleByteOffset / 2, a.adapterScaleByteOffset / 2,
          a.pooled ? a.pooledWidth : a.lowWidth};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   if (a.state) bindings[0] = &a.state->buffer;
   if (a.skip16) bindings[1] = &a.skip16->buffer;
   bindings[2] = a.w1;
@@ -798,7 +796,7 @@ std::vector<uint32_t> Kernels::mlpHiddenPermutation(uint32_t hidden) {
   return perm;
 }
 
-void Kernels::mlpPtx(VkCommandBuffer commands, const MlpArgs& a) {
+void Kernels::mlpPtx(exec::Commands commands, const MlpArgs& a) {
   check(a.input && a.input->format == Format::E4 && a.output && a.output->format == Format::E4, "PTX MLP formats");
   check(a.hidden % 32 == 0 && a.nout % 16 == 0 && a.K % 32 == 0, "PTX MLP shape");
   check(a.broadcastInput || a.inputColumnBase + a.batches * a.K <= a.input->channels, "PTX MLP input columns");
@@ -807,7 +805,7 @@ void Kernels::mlpPtx(VkCommandBuffer commands, const MlpArgs& a) {
   check(a.broadcastInput && a.hidden == 128 && a.nout == 32, "PTX MLP: the expert variant (broadcast input, 128 -> 32) only");
   const std::string entry = "mlp_e4m3_K" + std::to_string(a.K);
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-  VkDeviceAddress aAddr = context_.deviceAddress(a.input->buffer), w1Addr = context_.deviceAddress(*a.w1),
+  exec::Address aAddr = context_.deviceAddress(a.input->buffer), w1Addr = context_.deviceAddress(*a.w1),
                   w2Addr = context_.deviceAddress(*a.w2), dAddr = context_.deviceAddress(a.output->buffer);
   uint32_t rows = a.rows, inputStride = a.input->channels, inputColumnBase = a.inputColumnBase,
            outputStride = a.output->channels, outputColumnOffset = a.outputColumnOffset;
@@ -818,7 +816,7 @@ void Kernels::mlpPtx(VkCommandBuffer commands, const MlpArgs& a) {
   cudaLaunchTracked(commands, kernel.function, a.batches, rowGroups, 1, 128, 0, params, 9);
 }
 
-void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
+void Kernels::gemmMlp(exec::Commands commands, const MlpArgs& a) {
   check(a.input && a.input->format == Format::E4, "MLP input must be E4M3");
   check(a.output && a.output->format == Format::E4, "MLP output must be E4M3");
   check(a.K % 32 == 0 && a.hidden % 128 == 0 && a.nout % 16 == 0 && a.nout <= 64, "MLP shape");
@@ -827,7 +825,7 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
   check(a.outputColumnOffset % 16 == 0 && a.output->channels % 16 == 0 && a.nout % 16 == 0, "MLP output alignment");
   check(a.outputColumnOffset + a.batches * a.nout <= a.output->channels, "MLP output columns");
   check(a.output->allocRows >= alignRows(a.rows) && a.input->allocRows >= alignRows(a.rows), "MLP rows");
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, a.K);
   constants.add(1, a.hidden);
   constants.add(2, a.nout);
@@ -836,7 +834,7 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
   constants.add(5, std::max(1u, std::min(mlpDepth, a.K / 32)));
   struct Push { uint32_t rows, inputStride, inputColumnBase, outputStride, outputColumnOffset, batches; }
       push{a.rows, a.input->channels, a.inputColumnBase, a.output->channels, a.outputColumnOffset, a.batches};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &a.input->buffer;
   bindings[1] = a.w1;
   bindings[2] = a.w2;
@@ -857,7 +855,7 @@ uint32_t Kernels::ffnRowTiles(uint32_t channels) {
   return channels == 256 ? 3u : 4u;   // warps = E * rowTiles (<= 32); C=256: 24 warps at .maxnreg 80 keep one workgroup per SM
 }
 
-void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, const Chain& chain) {
+void Kernels::expertFfnPtx(exec::Commands commands, const ExpertFfnArgs& a, const Chain& chain) {
   check(a.input && a.input->format == Format::E4 && a.output && a.output->format == Format::E4, "PTX FFN formats");
   check(a.channels == 64 || a.channels == 128 || a.channels == 256, "PTX FFN channels");
   check(a.input->channels == a.channels && a.output->channels == a.channels, "PTX FFN strides");
@@ -871,20 +869,20 @@ void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, con
                   a.attended->channels == a.channels && a.ffnPrev->channels == a.channels), "PTX FFN proj inputs");
   const std::string entry = "ffn_e4m3_C" + std::to_string(a.channels) + "_R" + std::to_string(rowTiles) + (proj ? "_proj" : "");
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-  VkDeviceAddress pA = context_.deviceAddress(a.input->buffer), pW1 = context_.deviceAddress(*a.w1),
+  exec::Address pA = context_.deviceAddress(a.input->buffer), pW1 = context_.deviceAddress(*a.w1),
                   pW2 = context_.deviceAddress(*a.w2), pW3 = context_.deviceAddress(*a.w3),
                   pAux = context_.deviceAddress(a.auxTensor->raw), pOut = context_.deviceAddress(a.output->buffer);
-  VkDeviceAddress pAtt = proj ? context_.deviceAddress(a.attended->buffer) : pA;
-  VkDeviceAddress pPrev = proj ? context_.deviceAddress(a.ffnPrev->buffer) : pA;
-  VkDeviceAddress pWproj = proj ? context_.deviceAddress(*a.wproj) : pA;
-  VkDeviceAddress pAuxPrev = proj ? context_.deviceAddress(a.auxTensorPrev->raw) : pAux;
+  exec::Address pAtt = proj ? context_.deviceAddress(a.attended->buffer) : pA;
+  exec::Address pPrev = proj ? context_.deviceAddress(a.ffnPrev->buffer) : pA;
+  exec::Address pWproj = proj ? context_.deviceAddress(*a.wproj) : pA;
+  exec::Address pAuxPrev = proj ? context_.deviceAddress(a.auxTensorPrev->raw) : pAux;
   uint32_t rows = a.rows, auxHalf = a.auxByteOffset / 2, auxAttnHalf = a.auxAttnByteOffset / 2;
-  VkDeviceAddress pStateOut = a.stateOut ? context_.deviceAddress(a.stateOut->buffer) : pA;
+  exec::Address pStateOut = a.stateOut ? context_.deviceAddress(a.stateOut->buffer) : pA;
   uint32_t storeState = a.stateOut ? 1u : 0u;
-  VkDeviceAddress pWaitRows = chain.waitRows, pWaitBands = chain.waitBands, pSignal = chain.signal;
+  exec::Address pWaitRows = chain.waitRows, pWaitBands = chain.waitBands, pSignal = chain.signal;
   uint32_t waitExpected = chain.waitExpected, waitShiftY = chain.waitShiftY, width = a.width, waitMul = chain.waitMul, waitGroupRows = chain.waitGroupRows;
   check(!(pWaitRows || pWaitBands || pSignal) || width, "PTX FFN chaining needs the token row width");
-  VkDeviceAddress pError = chainStatusAddress();
+  exec::Address pError = chainStatusAddress();
   const void* params[] = {&pA, &pW1, &pW2, &pW3, &pAux, &pOut, &rows, &auxHalf, &pAtt, &pPrev, &pWproj, &auxAttnHalf, &pAuxPrev,
                           &pStateOut, &storeState, &pWaitRows, &waitExpected, &waitShiftY, &pWaitBands, &pSignal, &width, &waitMul, &waitGroupRows, &pError};
   const uint32_t groups = (a.rows + 16 * rowTiles - 1) / (16 * rowTiles);
@@ -894,8 +892,8 @@ void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, con
   cudaLaunchTracked(commands, kernel.function, groups, 1, 1, 32 * E * rowTiles, sharedBytes, params, 24, chain.chained);
 }
 
-void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, const vk::Buffer& weights, uint32_t Nmatrix,
-                           const Tensor& tensor, uint32_t scaleByteOffset, const vk::Buffer& prior, Activation& attended,
+void Kernels::qkvAttention(exec::Commands commands, const Activation& input, const exec::Buffer& weights, uint32_t Nmatrix,
+                           const Tensor& tensor, uint32_t scaleByteOffset, const exec::Buffer& prior, Activation& attended,
                            uint32_t width, uint32_t height, uint32_t heads, uint32_t shiftX, uint32_t shiftY, const Chain& chain) {
   check(input.format == Format::E4 && input.channels == heads * 32, "qkv attention input");
   check(Nmatrix == heads * 96, "qkv attention weight columns");
@@ -907,15 +905,15 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
     // PTX kernel (scripts/ptx/qkv_e4m3.py): grid (heads, windows), 128 threads per (window, head).
     const std::string entry = "qkv_e4m3_K" + std::to_string(heads * 32);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-    VkDeviceAddress pState = context_.deviceAddress(input.buffer), pW = context_.deviceAddress(weights),
+    exec::Address pState = context_.deviceAddress(input.buffer), pW = context_.deviceAddress(weights),
                     pPrior = context_.deviceAddress(prior), pAux = context_.deviceAddress(tensor.raw),
                     pOut = context_.deviceAddress(attended.buffer);
     const uint32_t qkvGroups = 12 * context_.smCount();   // persistent, each walking (window, head) items
     uint32_t w = width, h = height, sx = shiftX, sy = shiftY, wxs = windowsX, scaleWord = scaleByteOffset / 4, wc = windows,
              items = heads * windows;
-    VkDeviceAddress pWait = chain.waitBands, pSignal = chain.signal;
+    exec::Address pWait = chain.waitBands, pSignal = chain.signal;
     uint32_t waitMul = chain.waitMul, waitGroupRows = chain.waitGroupRows;
-    VkDeviceAddress pError = chainStatusAddress();
+    exec::Address pError = chainStatusAddress();
     const void* params[] = {&pState, &pW, &pPrior, &pAux, &pOut, &w, &h, &sx, &sy, &wxs, &scaleWord, &wc, &items, &pWait, &pSignal, &waitMul, &waitGroupRows, &pError};
     dispatchLabel_ = "qkv_ptx " + std::to_string(windows) + "w x" + std::to_string(heads) + " K" + std::to_string(heads * 32);
     check((heads & (heads - 1)) == 0 && windows * heads < (1u << 24), "PTX qkv item indexing");
@@ -927,9 +925,9 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
         "the GLSL fused QKV + attention does not implement counter chaining");
   struct Push { uint32_t width, height, channels, heads, shiftX, shiftY, windowsX, windowCount, scaleWordOffset, Nmatrix; }
       push{width, height, heads * 32, heads, shiftX, shiftY, windowsX, windows, scaleByteOffset / 4, Nmatrix};
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, heads * 32);
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &input.buffer;
   bindings[1] = &weights;
   bindings[2] = &prior;
@@ -940,12 +938,12 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
            std::min(windows, 65535u), (windows + 65534) / 65535);
 }
 
-void Kernels::windowNormalize(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor,
+void Kernels::windowNormalize(exec::Commands commands, const Activation& qkv, const Tensor& tensor,
                               uint32_t scaleByteOffset, Activation& normalized, uint32_t tokens, uint32_t heads) {
   check(qkv.format == Format::F16 && normalized.format == Format::E4, "normalize formats");
   check(qkv.channels == heads * 96 && normalized.channels == heads * 96, "normalize channels");
   struct Push { uint32_t tokens, heads, channels, scaleWordOffset; } push{tokens, heads, heads * 32, scaleByteOffset / 4};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[1] = &qkv.buffer;
   bindings[4] = &tensor.raw;
   bindings[5] = &normalized.buffer;
@@ -953,7 +951,7 @@ void Kernels::windowNormalize(VkCommandBuffer commands, const Activation& qkv, c
   dispatchLinear(commands, pipeline("window_normalize", {}), bindings, &push, sizeof(push), tokens * heads);
 }
 
-void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalized, const vk::Buffer& prior,
+void Kernels::windowAttend(exec::Commands commands, const Activation& normalized, const exec::Buffer& prior,
                            Activation& attended, uint32_t width, uint32_t height, uint32_t heads, uint32_t shiftX,
                            uint32_t shiftY) {
   check(normalized.format == Format::E4 && attended.format == Format::E4, "attend formats");
@@ -963,7 +961,7 @@ void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalize
   uint32_t windows = windowsX * windowsY;
   struct Push { uint32_t width, height, channels, heads, shiftX, shiftY, windowsX, windowCount; }
       push{width, height, heads * 32, heads, shiftX, shiftY, windowsX, windows};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &normalized.buffer;
   bindings[1] = &prior;
   bindings[5] = &attended.buffer;
@@ -994,41 +992,41 @@ bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
   return streamAvailable_;
 }
 
-void Kernels::globalNormalizePtx(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
+void Kernels::globalNormalizePtx(exec::Commands commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
                                  Activation& normalized, uint32_t tokens, uint32_t paddedTokens, uint32_t heads, const Chain* chain) {
   check(qkv.format == Format::F16 && qkv.channels == heads * 96 && normalized.format == Format::E4 &&
-            (VkDeviceSize)normalized.allocRows * normalized.channels >= (VkDeviceSize)3 * heads * paddedTokens * 32,
+            (exec::Size)normalized.allocRows * normalized.channels >= (exec::Size)3 * heads * paddedTokens * 32,
         "global normalize (PTX) formats");
   check(paddedTokens % 64 == 0 && paddedTokens >= tokens && scaleByteOffset % 4 == 0, "global normalize (PTX) tokens");
   const std::string entry = "global_normalize_e4m3";
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-  VkDeviceAddress pQkv = context_.deviceAddress(qkv.buffer), pAux = context_.deviceAddress(tensor.raw), pOut = context_.deviceAddress(normalized.buffer);
-  VkDeviceAddress pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
+  exec::Address pQkv = context_.deviceAddress(qkv.buffer), pAux = context_.deviceAddress(tensor.raw), pOut = context_.deviceAddress(normalized.buffer);
+  exec::Address pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
   uint32_t tok = tokens, pad = paddedTokens, h = heads, scaleWord = scaleByteOffset / 4, waitExpected = chain ? chain->waitExpected : 0;
-  VkDeviceAddress pError = chainStatusAddress();
+  exec::Address pError = chainStatusAddress();
   const void* params[] = {&pQkv, &pAux, &pOut, &tok, &pad, &h, &scaleWord, &pWait, &waitExpected, &pSignal, &pError};
   dispatchLabel_ = "global_normalize_ptx " + std::to_string(tokens) + "t x" + std::to_string(heads);
   noteChain(pWait, 0, pSignal);
   cudaLaunchTracked(commands, kernel.function, paddedTokens / 64, heads, 1, 64, 0, params, 11, chain && chain->chained);
 }
 
-void Kernels::globalAttentionStream(VkCommandBuffer commands, const Activation& normalized, Activation& attended, uint32_t tokens,
+void Kernels::globalAttentionStream(exec::Commands commands, const Activation& normalized, Activation& attended, uint32_t tokens,
                                     uint32_t paddedTokens, uint32_t heads, const Chain* chain) {
   check(normalized.format == Format::E4 && attended.format == Format::E4 && attended.channels == heads * 32, "global attention (stream) formats");
   check(paddedTokens % 64 == 0 && paddedTokens >= tokens && attended.allocRows >= tokens, "global attention (stream) tokens");
   const std::string entry = "global_attention_stream_e4m3";
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-  VkDeviceAddress pNorm = context_.deviceAddress(normalized.buffer), pOut = context_.deviceAddress(attended.buffer);
-  VkDeviceAddress pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
+  exec::Address pNorm = context_.deviceAddress(normalized.buffer), pOut = context_.deviceAddress(attended.buffer);
+  exec::Address pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
   uint32_t tok = tokens, pad = paddedTokens, h = heads, waitExpected = chain ? chain->waitExpected : 0;
-  VkDeviceAddress pError = chainStatusAddress();
+  exec::Address pError = chainStatusAddress();
   const void* params[] = {&pNorm, &pOut, &tok, &pad, &h, &pWait, &waitExpected, &pSignal, &pError};
   dispatchLabel_ = "global_attention_stream_ptx " + std::to_string(tokens) + "t x" + std::to_string(heads);
   noteChain(pWait, 0, pSignal);
   cudaLaunchTracked(commands, kernel.function, heads, paddedTokens / 64, 1, 128, 0, params, 9, chain && chain->chained);
 }
 
-void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
+void Kernels::globalAttention(exec::Commands commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
                               Activation& attended, uint32_t tokens, uint32_t paddedTokens, uint32_t heads,
                               const Activation* normalized, const Chain* chain) {
   check(qkv.format == Format::F16 && qkv.channels == heads * 96 && attended.format == Format::E4 &&
@@ -1039,10 +1037,10 @@ void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, c
   if (globalAttentionPtx(paddedTokens, normalized)) {
     const std::string entry = "global_attention_e4m3_p" + std::to_string(paddedTokens);
     PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
-    VkDeviceAddress pQkv = context_.deviceAddress(qkv.buffer), pAux = context_.deviceAddress(tensor.raw), pOut = context_.deviceAddress(attended.buffer);
-    VkDeviceAddress pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
+    exec::Address pQkv = context_.deviceAddress(qkv.buffer), pAux = context_.deviceAddress(tensor.raw), pOut = context_.deviceAddress(attended.buffer);
+    exec::Address pWait = chain ? chain->waitRows : 0, pSignal = chain ? chain->signal : 0;
     uint32_t tok = tokens, h = heads, scaleWord = scaleByteOffset / 4, waitExpected = chain ? chain->waitExpected : 0;
-    VkDeviceAddress pError = chainStatusAddress();
+    exec::Address pError = chainStatusAddress();
     const void* params[] = {&pQkv, &pAux, &pOut, &tok, &h, &scaleWord, &pWait, &waitExpected, &pSignal, &pError};
     check(kernel.dynamicShared, "global attention PTX without a dynamic_shared size");
     dispatchLabel_ = "global_attention_ptx " + std::to_string(tokens) + "t x" + std::to_string(heads);
@@ -1055,12 +1053,12 @@ void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, c
   const bool prenormalized = normalized != nullptr;
   const uint32_t chunk = std::min(paddedTokens, 256u);
   check(!prenormalized || (normalized->format == Format::E4 && normalized->allocRows >= paddedTokens), "global attention normalized buffer");
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, paddedTokens);
   constants.add(1, chunk);
   constants.add(2, prenormalized ? 1u : 0u);
   struct Push { uint32_t tokens, heads, channels, scaleWordOffset; } push{tokens, heads, heads * 32, scaleByteOffset / 4};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = prenormalized ? &normalized->buffer : &qkv.buffer;
   bindings[4] = &tensor.raw;
   bindings[5] = &attended.buffer;
@@ -1068,11 +1066,11 @@ void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, c
   dispatch(commands, pipeline("global_attention", constants), bindings, &push, sizeof(push), heads, paddedTokens / 64, 1);
 }
 
-void Kernels::globalNormalize(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor,
+void Kernels::globalNormalize(exec::Commands commands, const Activation& qkv, const Tensor& tensor,
                               uint32_t scaleByteOffset, Activation& normalized, uint32_t tokens, uint32_t heads) {
   check(qkv.format == Format::F16 && normalized.format == Format::E4, "global normalize formats");
   struct Push { uint32_t tokens, heads, channels, scaleWordOffset; } push{tokens, heads, heads * 32, scaleByteOffset / 4};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[1] = &qkv.buffer;
   bindings[4] = &tensor.raw;
   bindings[5] = &normalized.buffer;
@@ -1080,14 +1078,14 @@ void Kernels::globalNormalize(VkCommandBuffer commands, const Activation& qkv, c
   dispatchLinear(commands, pipeline("global_normalize", {}), bindings, &push, sizeof(push), tokens * heads);
 }
 
-void Kernels::globalAttend(VkCommandBuffer commands, const Activation& normalized, Activation& attended,
+void Kernels::globalAttend(exec::Commands commands, const Activation& normalized, Activation& attended,
                            uint32_t tokens, uint32_t paddedTokens, uint32_t heads) {
   check(normalized.format == Format::E4 && attended.format == Format::E4, "global attend formats");
   check(paddedTokens % 64 == 0 && paddedTokens >= tokens && normalized.allocRows >= paddedTokens, "global attend tokens");
-  vk::SpecConstants constants;
+  exec::SpecConstants constants;
   constants.add(0, paddedTokens);
   struct Push { uint32_t tokens, heads, channels; } push{tokens, heads, heads * 32};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
+  const exec::Buffer* bindings[exec::kGenericBindings] = {};
   bindings[0] = &normalized.buffer;
   bindings[5] = &attended.buffer;
   dispatchLabel_ = "global_attend";

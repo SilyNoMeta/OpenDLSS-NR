@@ -73,7 +73,7 @@ uint32_t tiledToken(uint32_t token) {
 }
 }  // namespace
 
-Model::Model(vk::Context& context, const std::string& directory, bool verifyHashes) : context_(context) {
+Model::Model(exec::Device& context, const std::string& directory, bool verifyHashes) : context_(context) {
   json::Value manifest = json::parse(readText(directory + "/manifest.json"));
   blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
   for (const json::Value& stage : manifest["stages"].array) {
@@ -160,7 +160,7 @@ std::vector<uint8_t> Model::fp8MatrixBytes(const Tensor& tensor, uint32_t byteOf
   return plain;
 }
 
-const vk::Buffer& Model::fp8Matrix(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t Nmatrix,
+const exec::Buffer& Model::fp8Matrix(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t Nmatrix,
                                    bool swizzleK, uint32_t batchK, bool tileMajor) {
   if (batchK == 0) batchK = K;
   std::string key = tensor.name + (tileMajor ? "/fp8K32/" : "/fp8T/") + std::to_string(byteOffset) + "/" + std::to_string(K) +
@@ -168,12 +168,12 @@ const vk::Buffer& Model::fp8Matrix(const Tensor& tensor, uint32_t byteOffset, ui
   auto it = matrices_.find(key);
   if (it != matrices_.end()) return it->second;
   std::vector<uint8_t> plain = fp8MatrixBytes(tensor, byteOffset, K, Nmatrix, swizzleK, batchK, tileMajor);
-  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights");
+  exec::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights");
   context_.upload(buffer, plain.data(), plain.size());
   return matrices_[key] = buffer;
 }
 
-const vk::Buffer& Model::fp8MatrixPermuted(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t Nmatrix,
+const exec::Buffer& Model::fp8MatrixPermuted(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t Nmatrix,
                                            uint32_t batchK, const std::vector<uint32_t>& columnSource, const std::string& tag) {
   std::string key = tensor.name + "/fp8perm/" + tag + "/" + std::to_string(byteOffset) + "/" + std::to_string(K) + "x" +
                     std::to_string(Nmatrix) + "/" + std::to_string(batchK);
@@ -181,12 +181,12 @@ const vk::Buffer& Model::fp8MatrixPermuted(const Tensor& tensor, uint32_t byteOf
   if (it != matrices_.end()) return it->second;
   if (columnSource.size() != Nmatrix) throw std::runtime_error("column permutation size mismatch: " + key);
   std::vector<uint8_t> plain = fp8MatrixBytes(tensor, byteOffset, K, Nmatrix, true, batchK, true, &columnSource);
-  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights (permuted)");
+  exec::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights (permuted)");
   context_.upload(buffer, plain.data(), plain.size());
   return matrices_[key] = buffer;
 }
 
-const vk::Buffer& Model::f16Matrix(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t N,
+const exec::Buffer& Model::f16Matrix(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t N,
                                    uint32_t& paddedN) {
   paddedN = (N + 15) & ~15u;
   std::string key = tensor.name + "/f16/" + std::to_string(byteOffset) + "/" + std::to_string(K) + "x" +
@@ -203,12 +203,12 @@ const vk::Buffer& Model::f16Matrix(const Tensor& tensor, uint32_t byteOffset, ui
       plain[(size_t)k * paddedN + n] = (uint16_t)(p[0] | (p[1] << 8));
     }
   }
-  vk::Buffer buffer = context_.createBuffer(plain.size() * 2, false, "f16 weights");
+  exec::Buffer buffer = context_.createBuffer(plain.size() * 2, false, "f16 weights");
   context_.upload(buffer, plain.data(), plain.size() * 2);
   return matrices_[key] = buffer;
 }
 
-const vk::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByteOffset, uint32_t heads) {
+const exec::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByteOffset, uint32_t heads) {
   std::string key = tensor.name + "/prior/" + std::to_string(relativeByteOffset) + "/" + std::to_string(heads);
   auto it = matrices_.find(key);
   if (it != matrices_.end()) return it->second;
@@ -232,7 +232,7 @@ const vk::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByt
       }
     }
   }
-  vk::Buffer buffer = context_.createBuffer(prior.size() * 2, false, "attention prior");
+  exec::Buffer buffer = context_.createBuffer(prior.size() * 2, false, "attention prior");
   context_.upload(buffer, prior.data(), prior.size() * 2);
   return matrices_[key] = buffer;
 }

@@ -150,25 +150,6 @@ std::string lower(std::string text) {
 }
 }  // namespace
 
-const char* backendName(Backend backend) {
-  switch (backend) {
-    case Backend::Native: return "native";
-    case Backend::Compat: return "compat";
-    case Backend::Sm86: return "sm86";
-  }
-  return "?";
-}
-
-const char* backendDescription(Backend backend) {
-  switch (backend) {
-    case Backend::Native: return "native FP8 (E4M3 cooperative matrices and FP8 PTX: Ada, Hopper, Blackwell)";
-    case Backend::Compat: return "compatibility (software E4M3 in scalar GLSL, no tensor cores, no fusion, no chaining)";
-    case Backend::Sm86:
-      return "sm86 (native PTX lowered to f16 tensor cores, compatibility GLSL elsewhere; not bit-exact to native)";
-  }
-  return "?";
-}
-
 std::optional<Backend> requestedBackend() {
   const std::string text = lower(getenv("DLSS5VK_BACKEND") ? getenv("DLSS5VK_BACKEND") : "");
   if (text.empty() || text == "auto") return std::nullopt;
@@ -615,8 +596,10 @@ uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags requir
   throw std::runtime_error("no suitable memory type");
 }
 
-Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* label, VkBufferUsageFlags extra) {
+Buffer Context::createBuffer(exec::Size size, bool hostVisible, const char* label, uint32_t extra) {
   Buffer result;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
   result.size = std::max<VkDeviceSize>(size, 16);
   result.hostVisible = hostVisible;
   result.label = label;
@@ -625,9 +608,10 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
+  VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &buffer));
+  result.buffer = buffer;
   VkMemoryRequirements requirements;
-  vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+  vkGetBufferMemoryRequirements(device_, buffer, &requirements);
   VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
   allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
   VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -637,24 +621,25 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
       requirements.memoryTypeBits,
       hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                   : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
-  VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
+  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &memory));
+  result.memory = memory;
+  VK_CHECK(vkBindBufferMemory(device_, buffer, memory, 0));
   result.allocation = requirements.size;
   (hostVisible ? memoryUse_.hostVisible : memoryUse_.deviceLocal) += result.allocation;
   memoryUse_.peakDeviceLocal = std::max(memoryUse_.peakDeviceLocal, memoryUse_.deviceLocal);
-  if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+  if (hostVisible) VK_CHECK(vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
   return result;
 }
 
 void Context::destroyBuffer(Buffer& buffer) {
   if (buffer.memory) (buffer.hostVisible ? memoryUse_.hostVisible : memoryUse_.deviceLocal) -= buffer.allocation;
-  if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
-  if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
-  if (buffer.memory) vkFreeMemory(device_, buffer.memory, nullptr);
+  if (buffer.mapped) vkUnmapMemory(device_, memoryOf(buffer));
+  if (buffer.buffer) vkDestroyBuffer(device_, handle(buffer), nullptr);
+  if (buffer.memory) vkFreeMemory(device_, memoryOf(buffer), nullptr);
   buffer = Buffer{};
 }
 
-void Context::upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset) {
+void Context::upload(const Buffer& target, const void* data, exec::Size size, exec::Size offset) {
   if (offset + size > target.size) throw std::runtime_error(std::string("upload overflows ") + target.label);
   const uint8_t* bytes = static_cast<const uint8_t*>(data);
   VkDeviceSize done = 0;
@@ -663,7 +648,7 @@ void Context::upload(const Buffer& target, const void* data, VkDeviceSize size, 
     memcpy(staging_.mapped, bytes + done, chunk);
     VkCommandBuffer commands = beginCommands();
     VkBufferCopy region{0, offset + done, chunk};
-    vkCmdCopyBuffer(commands, staging_.buffer, target.buffer, 1, &region);
+    vkCmdCopyBuffer(commands, handle(staging_), handle(target), 1, &region);
     endAndSubmit(commands, true);
     done += chunk;
   }
@@ -671,11 +656,11 @@ void Context::upload(const Buffer& target, const void* data, VkDeviceSize size, 
 
 void Context::fillZero(const Buffer& target) {
   VkCommandBuffer commands = beginCommands();
-  vkCmdFillBuffer(commands, target.buffer, 0, VK_WHOLE_SIZE, 0);
+  vkCmdFillBuffer(commands, handle(target), 0, VK_WHOLE_SIZE, 0);
   endAndSubmit(commands, true);
 }
 
-std::vector<uint8_t> Context::download(const Buffer& source, VkDeviceSize size, VkDeviceSize offset) {
+std::vector<uint8_t> Context::download(const Buffer& source, exec::Size size, exec::Size offset) {
   if (offset + size > source.size) throw std::runtime_error(std::string("download overflows ") + source.label);
   std::vector<uint8_t> result(size);
   VkDeviceSize done = 0;
@@ -683,7 +668,7 @@ std::vector<uint8_t> Context::download(const Buffer& source, VkDeviceSize size, 
     VkDeviceSize chunk = std::min(size - done, staging_.size);
     VkCommandBuffer commands = beginCommands();
     VkBufferCopy region{offset + done, 0, chunk};
-    vkCmdCopyBuffer(commands, source.buffer, staging_.buffer, 1, &region);
+    vkCmdCopyBuffer(commands, handle(source), handle(staging_), 1, &region);
     endAndSubmit(commands, true);
     memcpy(result.data() + done, staging_.mapped, chunk);
     done += chunk;
@@ -691,7 +676,7 @@ std::vector<uint8_t> Context::download(const Buffer& source, VkDeviceSize size, 
   return result;
 }
 
-VkShaderModule Context::loadShaderModule(const std::string& spvPath) {
+exec::Shader Context::loadShaderModule(const std::string& spvPath) {
   std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
   if (!file) throw std::runtime_error("missing shader " + spvPath);
   std::streamsize size = file.tellg();
@@ -707,11 +692,13 @@ VkShaderModule Context::loadShaderModule(const std::string& spvPath) {
   return module;
 }
 
-Pipeline Context::createComputePipeline(VkShaderModule module, const SpecConstants& constants,
+Pipeline Context::createComputePipeline(exec::Shader module, const SpecConstants& constants,
                                         const char* label, uint32_t requiredSubgroupSize) {
+  std::vector<VkSpecializationMapEntry> entries;
+  for (const SpecConstants::Entry& entry : constants.entries) entries.push_back({entry.id, entry.offset, 4});
   VkSpecializationInfo specialization{};
-  specialization.mapEntryCount = (uint32_t)constants.entries.size();
-  specialization.pMapEntries = constants.entries.data();
+  specialization.mapEntryCount = (uint32_t)entries.size();
+  specialization.pMapEntries = entries.data();
   specialization.dataSize = constants.data.size() * 4;
   specialization.pData = constants.data.data();
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupInfo{
@@ -721,7 +708,7 @@ Pipeline Context::createComputePipeline(VkShaderModule module, const SpecConstan
   stage.pNext = requiredSubgroupSize ? &subgroupInfo : nullptr;
   stage.flags = requiredSubgroupSize ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0;
   stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  stage.module = module;
+  stage.module = static_cast<VkShaderModule>(module);
   stage.pName = "main";
   stage.pSpecializationInfo = constants.entries.empty() ? nullptr : &specialization;
   VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -731,14 +718,16 @@ Pipeline Context::createComputePipeline(VkShaderModule module, const SpecConstan
     info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
   Pipeline result;
   result.label = label;
-  VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &result.pipeline));
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline));
+  result.pipeline = pipeline;
   return result;
 }
 
 std::string Context::pipelineStatistics(const Pipeline& pipeline, bool includeInternal) {
   std::string report;
   VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
-  pipelineInfo.pipeline = pipeline.pipeline;
+  pipelineInfo.pipeline = handle(pipeline);
   uint32_t executableCount = 0;
   if (!executableProperties_) return "n/a (VK_KHR_pipeline_executable_properties not enabled on this backend)";
   if (vkGetPipelineExecutablePropertiesKHR(device_, &pipelineInfo, &executableCount, nullptr) != VK_SUCCESS) return "n/a";
@@ -749,7 +738,7 @@ std::string Context::pipelineStatistics(const Pipeline& pipeline, bool includeIn
     report += std::string(executables[e].name) + " (" + executables[e].description + ") subgroup " +
               std::to_string(executables[e].subgroupSize) + "\n";
     VkPipelineExecutableInfoKHR executableInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
-    executableInfo.pipeline = pipeline.pipeline;
+    executableInfo.pipeline = handle(pipeline);
     executableInfo.executableIndex = e;
     uint32_t statisticCount = 0;
     vkGetPipelineExecutableStatisticsKHR(device_, &executableInfo, &statisticCount, nullptr);
@@ -787,7 +776,7 @@ std::string Context::pipelineStatistics(const Pipeline& pipeline, bool includeIn
 }
 
 void Context::destroyPipeline(Pipeline& pipeline) {
-  if (pipeline.pipeline) vkDestroyPipeline(device_, pipeline.pipeline, nullptr);
+  if (pipeline.pipeline) vkDestroyPipeline(device_, handle(pipeline), nullptr);
   pipeline = Pipeline{};
 }
 
@@ -804,7 +793,7 @@ VkDescriptorSet Context::allocateSet(const Buffer* const bindings[kGenericBindin
   VkWriteDescriptorSet writes[kGenericBindings];
   for (uint32_t index = 0; index < kGenericBindings; ++index) {
     const Buffer* buffer = bindings[index] ? bindings[index] : &dummy_;
-    infos[index] = {buffer->buffer, offsets ? offsets[index] : 0,
+    infos[index] = {handle(*buffer), offsets ? offsets[index] : 0,
                     ranges && ranges[index] ? ranges[index] : VK_WHOLE_SIZE};
     writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[index].dstSet = set;
@@ -852,7 +841,27 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
   }
 }
 
-void Context::computeBarrier(VkCommandBuffer commands) {
+void Context::dispatch(exec::Commands stream, exec::PipelineHandle pipeline, const Buffer* const bindings[kGenericBindings],
+                       const void* push, uint32_t pushBytes, uint32_t x, uint32_t y, uint32_t z) {
+  VkCommandBuffer commands = handle(stream);
+  VkDescriptorSet set = allocateSet(bindings);
+  vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, static_cast<VkPipeline>(pipeline));
+  vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &set, 0, nullptr);
+  vkCmdPushConstants(commands, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushBytes, push);
+  vkCmdDispatch(commands, x, y, z);
+}
+
+void Context::zeroBuffer(exec::Commands commands, const Buffer& target) {
+  vkCmdFillBuffer(handle(commands), handle(target), 0, VK_WHOLE_SIZE, 0);
+}
+
+void Context::copyBuffer(exec::Commands commands, const Buffer& source, const Buffer& target, exec::Size bytes) {
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(handle(commands), handle(source), handle(target), 1, &region);
+}
+
+void Context::computeBarrier(exec::Commands stream) {
+  VkCommandBuffer commands = handle(stream);
   // Compute -> compute only. Including the transfer stages here made NVIDIA flush
   // caches between every dispatch (tens of microseconds per barrier once L2 is dirty).
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -867,7 +876,8 @@ void Context::computeBarrier(VkCommandBuffer commands) {
 }
 
 // Captures and uploads only.
-void Context::transferBarrier(VkCommandBuffer commands) {
+void Context::transferBarrier(exec::Commands stream) {
+  VkCommandBuffer commands = handle(stream);
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -880,7 +890,7 @@ void Context::transferBarrier(VkCommandBuffer commands) {
   vkCmdPipelineBarrier2(commands, &dependency);
 }
 
-VkQueryPool Context::createTimestampPool(uint32_t count) {
+exec::Timer Context::createTimestampPool(uint32_t count) {
   VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
   info.queryType = VK_QUERY_TYPE_TIMESTAMP;
   info.queryCount = count;
@@ -890,7 +900,21 @@ VkQueryPool Context::createTimestampPool(uint32_t count) {
   return pool;
 }
 
-std::vector<double> Context::readTimestampsMs(VkQueryPool pool, uint32_t count) {
+void Context::destroyTimestampPool(exec::Timer pool) {
+  if (pool) vkDestroyQueryPool(device_, static_cast<VkQueryPool>(pool), nullptr);
+}
+
+void Context::resetTimestamps(exec::Commands commands, exec::Timer pool, uint32_t count) {
+  vkCmdResetQueryPool(handle(commands), static_cast<VkQueryPool>(pool), 0, count);
+}
+
+void Context::writeTimestamp(exec::Commands commands, exec::Timer pool, uint32_t index, bool first) {
+  vkCmdWriteTimestamp(handle(commands), first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      static_cast<VkQueryPool>(pool), index);
+}
+
+std::vector<double> Context::readTimestampsMs(exec::Timer timer, uint32_t count) {
+  const VkQueryPool pool = static_cast<VkQueryPool>(timer);
   std::vector<uint64_t> ticks(count);
   VK_CHECK(vkGetQueryPoolResults(device_, pool, 0, count, ticks.size() * 8, ticks.data(), 8,
                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
@@ -903,13 +927,13 @@ std::vector<double> Context::readTimestampsMs(VkQueryPool pool, uint32_t count) 
 
 namespace vk {
 
-VkDeviceAddress Context::deviceAddress(const Buffer& buffer) const {
+exec::Address Context::deviceAddress(const Buffer& buffer) const {
   VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-  info.buffer = buffer.buffer;
+  info.buffer = handle(buffer);
   return vkGetBufferDeviceAddress(device_, &info);
 }
 
-VkCudaModuleNV Context::createCudaModule(const std::string& ptx) {
+exec::KernelModule Context::createCudaModule(const std::string& ptx) {
   VkCudaModuleCreateInfoNV info{VK_STRUCTURE_TYPE_CUDA_MODULE_CREATE_INFO_NV};
   info.dataSize = ptx.size() + 1;
   info.pData = ptx.c_str();
@@ -918,27 +942,28 @@ VkCudaModuleNV Context::createCudaModule(const std::string& ptx) {
   return module;
 }
 
-VkCudaFunctionNV Context::createCudaFunction(VkCudaModuleNV module, const char* name) {
+exec::Kernel Context::createCudaFunction(exec::KernelModule module, const char* name) {
   VkCudaFunctionCreateInfoNV info{VK_STRUCTURE_TYPE_CUDA_FUNCTION_CREATE_INFO_NV};
-  info.module = module;
+  info.module = static_cast<VkCudaModuleNV>(module);
   info.pName = name;
   VkCudaFunctionNV function = VK_NULL_HANDLE;
   VK_CHECK(vkCreateCudaFunctionNV(device_, &info, nullptr, &function));
   return function;
 }
 
-void Context::destroyCudaFunction(VkCudaFunctionNV function) {
-  if (function) vkDestroyCudaFunctionNV(device_, function, nullptr);
+void Context::destroyCudaFunction(exec::Kernel function) {
+  if (function) vkDestroyCudaFunctionNV(device_, static_cast<VkCudaFunctionNV>(function), nullptr);
 }
 
-void Context::destroyCudaModule(VkCudaModuleNV module) {
-  if (module) vkDestroyCudaModuleNV(device_, module, nullptr);
+void Context::destroyCudaModule(exec::KernelModule module) {
+  if (module) vkDestroyCudaModuleNV(device_, static_cast<VkCudaModuleNV>(module), nullptr);
 }
 
-void Context::cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+void Context::cudaLaunch(exec::Commands stream, exec::Kernel function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                          uint32_t blockX, uint32_t sharedBytes, const void* const* params, size_t paramCount) {
+  VkCommandBuffer commands = handle(stream);
   VkCudaLaunchInfoNV info{VK_STRUCTURE_TYPE_CUDA_LAUNCH_INFO_NV};
-  info.function = function;
+  info.function = static_cast<VkCudaFunctionNV>(function);
   info.gridDimX = gridX; info.gridDimY = gridY; info.gridDimZ = gridZ;
   info.blockDimX = blockX; info.blockDimY = 1; info.blockDimZ = 1;
   info.sharedMemBytes = sharedBytes;

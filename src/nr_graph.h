@@ -44,11 +44,11 @@ class Graph {
     bool captureIntermediates = false;  // also copy the intra-block tensors (FFN, QKV, attention)
     bool fusedBlocks = true;            // one fused dispatch per 32-channel block (false: reference kernels)
   };
-  Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options);
+  Graph(exec::Device& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options);
   ~Graph();
 
   // Record the complete network. `inputFeatures` is f32 [fullWidth*fullHeight][16].
-  void record(VkCommandBuffer commands, const Activation& inputFeatures);
+  void record(exec::Commands commands, const Activation& inputFeatures);
 
   const Activation& head() const { return *head_; }  // f32 [full rows][4]
   const std::map<std::string, Activation*>& boundaries() const { return boundaries_; }
@@ -101,7 +101,7 @@ class Graph {
   Temporaries createTemporaries(const std::string& label, uint32_t rows, uint32_t channels);
   SplitTemporaries createSplitTemporaries(const std::string& label, uint32_t rows);
 
-  void encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const Activation& state, Activation* output,
+  void encodeFusedBlock(exec::Commands commands, Temporaries& temps, const Activation& state, Activation* output,
                         int block, uint32_t channels, uint32_t width, uint32_t height, uint32_t phase,
                         const FusedLayout& layout, const Tensor& tensor, const Activation* ffnSkipOverride,
                         Activation* rawOutput, Activation* pooledOutput = nullptr, uint32_t pooledWidth = 0,
@@ -109,22 +109,22 @@ class Graph {
                         uint32_t c32WaitScale = 0, bool c32ChainOut = false);
   // Deferred projection: the previous block's attended tile, FFN publication and projection weights, consumed by
   // the next block's PTX FFN kernel (which computes the block state on chip).
-  struct PendingProjection { const Activation* attended = nullptr; const Activation* ffnQ = nullptr; const vk::Buffer* wproj = nullptr; uint32_t auxAttn = 0; const Tensor* tensor = nullptr; Activation* stateOut = nullptr; int block = 0;
+  struct PendingProjection { const Activation* attended = nullptr; const Activation* ffnQ = nullptr; const exec::Buffer* wproj = nullptr; uint32_t auxAttn = 0; const Tensor* tensor = nullptr; Activation* stateOut = nullptr; int block = 0;
                              uint32_t winExpected = 0, shiftY = 0; };
   PendingProjection pendingProjection_{};
   bool hasPendingProjection_ = false;
   // Chained 32-channel blocks: the producer block's window-row counters (consumed by the next fused block).
-  struct C32Chain { VkDeviceAddress rows = 0; uint32_t expected = 0, shiftY = 0; bool valid = false; } c32Prev_{};
+  struct C32Chain { exec::Address rows = 0; uint32_t expected = 0, shiftY = 0; bool valid = false; } c32Prev_{};
   // Fill the chain fields of a fused 32-channel block: wait on c32Prev_ (waitScale: 0 same, 1 producer 2x, 2 producer
   // half resolution), signal / chain when a consumer follows; then records this block as the producer.
   void chainBlock32(Kernels::FusedBlock32Args& f, int block, uint32_t waitScale, bool chainOut);
-  void encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, const Activation& state,
+  void encodeSplitBlock(exec::Commands commands, SplitTemporaries& temps, const Activation& state,
                         Activation* output, int block, uint32_t width, uint32_t height, uint32_t phase,
                         Activation* rawOutput, bool firstInStage = true, bool lastInStage = true);
-  void encodeVit(VkCommandBuffer commands, Activation& state, uint32_t tokens);
-  void capture(VkCommandBuffer commands, const std::string& name, const Activation& source);
+  void encodeVit(exec::Commands commands, Activation& state, uint32_t tokens);
+  void capture(exec::Commands commands, const std::string& name, const Activation& source);
 
-  vk::Context& context_;
+  exec::Device& context_;
   Model& model_;
   Kernels& kernels_;
   Geometry geometry_;

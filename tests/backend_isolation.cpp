@@ -1,5 +1,6 @@
 // Public runtime regression test: two backends in one process, plus borrowed enabled-feature checks.
 #include "kernels.h"
+#include "vk_context.h"
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>

@@ -37,6 +37,7 @@ if(UNIX AND NOT APPLE)
 endif()
 
 add_executable(dlss5vk
+    src/exec.cpp
     src/gpu_arch.cpp
     src/kernels.cpp
     src/main.cpp

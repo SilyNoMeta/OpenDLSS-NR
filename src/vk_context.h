@@ -1,8 +1,11 @@
 // Minimal Vulkan compute host for the DLSS-NR port: one device, one queue,
 // storage buffers, compute pipelines with specialization constants, a generic
-// eight-binding descriptor layout and GPU timestamps. No graphics, no windows.
+// twelve-binding descriptor layout and GPU timestamps. No graphics, no windows.
+// The Vulkan adapter of the execution surface in exec.h.
 #pragma once
 #include <volk.h>
+
+#include "exec.h"
 
 #include <array>
 #include <cstdint>
@@ -23,49 +26,24 @@
 
 namespace vk {
 
-struct Buffer {
-  VkBuffer buffer = VK_NULL_HANDLE;
-  VkDeviceMemory memory = VK_NULL_HANDLE;
-  VkDeviceSize size = 0;
-  bool hostVisible = false;
-  void* mapped = nullptr;
-  const char* label = "";
-  VkDeviceSize allocation = 0;   // bytes of the memory allocation behind it (what the accounting counts)
-};
+// The neutral types of exec.h under their Vulkan names. A Buffer's `buffer` / `memory` hold the VkBuffer and
+// VkDeviceMemory, a Pipeline's `pipeline` the VkPipeline (handles are pointers on every 64-bit target).
+using Buffer = exec::Buffer;
+using SpecConstants = exec::SpecConstants;
+using Pipeline = exec::Pipeline;
+using Backend = exec::Backend;
+using exec::backendDescription;
+using exec::backendName;
+using exec::kGenericBindings;
+using exec::kPushConstantBytes;
+static_assert(sizeof(VkBuffer) == sizeof(void*) && sizeof(VkPipeline) == sizeof(void*), "64-bit Vulkan handles");
+inline VkBuffer handle(const Buffer& buffer) { return static_cast<VkBuffer>(buffer.buffer); }
+inline VkDeviceMemory memoryOf(const Buffer& buffer) { return static_cast<VkDeviceMemory>(buffer.memory); }
+inline VkPipeline handle(const Pipeline& pipeline) { return static_cast<VkPipeline>(pipeline.pipeline); }
+inline VkCommandBuffer handle(exec::Commands commands) { return static_cast<VkCommandBuffer>(commands.stream); }
 
-constexpr uint32_t kGenericBindings = 12;
-constexpr uint32_t kPushConstantBytes = 128;
-
-struct SpecConstants {
-  std::vector<VkSpecializationMapEntry> entries;
-  std::vector<uint32_t> data;
-  void add(uint32_t id, uint32_t value) {
-    entries.push_back({id, (uint32_t)(data.size() * 4), 4});
-    data.push_back(value);
-  }
-  void addFloat(uint32_t id, float value) {
-    uint32_t bits;
-    memcpy(&bits, &value, 4);
-    add(id, bits);
-  }
-};
-
-struct Pipeline {
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  const char* label = "";
-};
-
-// The routes the NR kernels run on. Each has its own device requirements and its own kernels, and none stands in for
-// another unless asked to: DLSS5VK_BACKEND=auto (the default) takes the fastest route the device supports and says
-// which and why; an explicit name is that route or an error.
-enum class Backend {
-  Native,   // E4M3 cooperative matrices + FP8 PTX, fused blocks, counter chaining (Ada, Hopper, Blackwell)
-  Compat,   // software E4M3 in scalar GLSL: any NVIDIA Vulkan 1.3 GPU, no tensor cores, no fusion, no chaining; exact
-  Sm86,     // the native PTX kernels lowered to f16 tensor cores (Ampere, compute capability 8.x) through
-            // VK_NV_cuda_kernel_launch, the compatibility GLSL elsewhere; close to native, not bit-exact
-};
-const char* backendName(Backend backend);          // "native", "compat", "sm86"
-const char* backendDescription(Backend backend);   // one line for logs
+// DLSS5VK_BACKEND=auto (the default) takes the fastest route the device supports and says which and why; an
+// explicit name is that route or an error.
 std::optional<Backend> requestedBackend();          // DLSS5VK_BACKEND, empty for auto; throws on an unknown name
 
 // The device features / extensions a backend needs, as a stable pNext chain (the demo hands it to the renderer's
@@ -125,12 +103,14 @@ struct BorrowedDevice {
   const VkDeviceCreateInfo* createInfo = nullptr;   // only read during the constructor
 };
 
-class Context {
+class Context : public exec::Device {
  public:
   Context();   // its own instance and device, on selectDevice's choice
   // Adopt a device created elsewhere; the instance / device are not destroyed by this object.
   explicit Context(const BorrowedDevice& borrowed);
-  ~Context();
+  ~Context() override;
+  const char* api() const override { return "vulkan"; }
+  bool chainSupported() const override { return true; }
   uint32_t queueFamily() const { return queueFamily_; }
   uint32_t queueIndex() const { return queueIndex_; }
   VkInstance instance() const { return instance_; }
@@ -142,34 +122,34 @@ class Context {
 
   VkDevice device() const { return device_; }
 
-  uint32_t smCount() const { return smCount_; }
+  uint32_t smCount() const override { return smCount_; }
   VkQueue queue() const { return queue_; }
   VkPhysicalDevice physical() const { return physical_; }
   float timestampPeriodNs() const { return timestampPeriod_; }
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const { return deviceName_; }
-  Backend backend() const { return backend_; }
-  bool nativeFp8() const { return backend_ == Backend::Native; }   // FP8 cooperative matrices and conversions in GLSL
-  bool ptxKernels() const { return backend_ == Backend::Native || backend_ == Backend::Sm86; }
+  Backend backend() const override { return backend_; }
+  bool nativeFp8() const override { return backend_ == Backend::Native; }   // FP8 cooperative matrices and conversions in GLSL
   uint32_t subgroupSize() const { return subgroupSize_; }
 
   // Buffers -----------------------------------------------------------------
-  Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
-                      VkBufferUsageFlags extra = 0);
-  void destroyBuffer(Buffer& buffer);
+  Buffer createBuffer(exec::Size size, bool hostVisible, const char* label, uint32_t extra = 0) override;   // extra: VkBufferUsageFlags
+  void destroyBuffer(Buffer& buffer) override;
   // Upload through a staging buffer and wait for completion.
-  void upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
-  void fillZero(const Buffer& target);
+  void upload(const Buffer& target, const void* data, exec::Size size, exec::Size offset = 0) override;
+  void fillZero(const Buffer& target) override;
   // Download via staging buffer and wait for completion.
-  std::vector<uint8_t> download(const Buffer& source, VkDeviceSize size, VkDeviceSize offset = 0);
+  std::vector<uint8_t> download(const Buffer& source, exec::Size size, exec::Size offset = 0) override;
   const Buffer& dummyBuffer() const { return dummy_; }
 
   // Pipelines -----------------------------------------------------------------
-  VkShaderModule loadShaderModule(const std::string& spvPath);
-  Pipeline createComputePipeline(VkShaderModule module, const SpecConstants& constants,
-                                 const char* label, uint32_t requiredSubgroupSize = 32);
-  void destroyPipeline(Pipeline& pipeline);
+  exec::Shader loadShaderModule(const std::string& spvPath) override;   // a VkShaderModule
+  Pipeline createComputePipeline(exec::Shader module, const SpecConstants& constants,
+                                 const char* label, uint32_t requiredSubgroupSize = 32) override;
+  void destroyPipeline(Pipeline& pipeline) override;
+  void dispatch(exec::Commands commands, exec::PipelineHandle pipeline, const Buffer* const bindings[kGenericBindings],
+                const void* push, uint32_t pushBytes, uint32_t x, uint32_t y, uint32_t z) override;
   // VK_KHR_pipeline_executable_properties: register/spill statistics (and SASS when available).
   void setCaptureStatistics(bool enabled) { captureStatistics_ = enabled; }
   std::string pipelineStatistics(const Pipeline& pipeline, bool includeInternal = false);
@@ -185,20 +165,25 @@ class Context {
   VkCommandBuffer beginCommands();
   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
   void waitIdle() { VK_CHECK(vkQueueWaitIdle(queue_)); }
-  void computeBarrier(VkCommandBuffer commands);   // compute -> compute
+  void computeBarrier(exec::Commands commands) override;   // compute -> compute
   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
-  VkDeviceAddress deviceAddress(const Buffer& buffer) const;
-  VkCudaModuleNV createCudaModule(const std::string& ptx);
-  VkCudaFunctionNV createCudaFunction(VkCudaModuleNV module, const char* name);
-  void destroyCudaFunction(VkCudaFunctionNV function);
-  void destroyCudaModule(VkCudaModuleNV module);
-  void cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-                  uint32_t blockX, uint32_t sharedBytes, const void* const* params, size_t paramCount);
-  void transferBarrier(VkCommandBuffer commands);  // compute/transfer -> compute/transfer (captures, uploads)
+  exec::Address deviceAddress(const Buffer& buffer) const override;
+  exec::KernelModule createCudaModule(const std::string& ptx) override;                        // a VkCudaModuleNV
+  exec::Kernel createCudaFunction(exec::KernelModule module, const char* name) override;       // a VkCudaFunctionNV
+  void destroyCudaFunction(exec::Kernel function) override;
+  void destroyCudaModule(exec::KernelModule module) override;
+  void cudaLaunch(exec::Commands commands, exec::Kernel function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                  uint32_t blockX, uint32_t sharedBytes, const void* const* params, size_t paramCount) override;
+  void transferBarrier(exec::Commands commands) override;  // compute/transfer -> compute/transfer (captures, uploads)
+  void zeroBuffer(exec::Commands commands, const Buffer& target) override;
+  void copyBuffer(exec::Commands commands, const Buffer& source, const Buffer& target, exec::Size bytes) override;
 
   // Timestamps -----------------------------------------------------------------
-  VkQueryPool createTimestampPool(uint32_t count);
-  std::vector<double> readTimestampsMs(VkQueryPool pool, uint32_t count);
+  exec::Timer createTimestampPool(uint32_t count) override;                                    // a VkQueryPool
+  void destroyTimestampPool(exec::Timer pool) override;
+  void resetTimestamps(exec::Commands commands, exec::Timer pool, uint32_t count) override;
+  void writeTimestamp(exec::Commands commands, exec::Timer pool, uint32_t index, bool first) override;
+  std::vector<double> readTimestampsMs(exec::Timer pool, uint32_t count) override;
 
   uint32_t maxComputeSharedMemory() const { return maxSharedMemory_; }
 
