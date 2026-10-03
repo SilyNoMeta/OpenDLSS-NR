@@ -33,7 +33,9 @@ class D3D11Device final : public exec::Device {
  public:
   // Its own device on the NVIDIA adapter (the tool, the tests, the comparison harness).
   D3D11Device(exec::Backend backend, bool debugLayer = false);
-  // A host's device and its immediate context.
+  // A host's device and its immediate context. The host destroys this object, and the kernels and buffers made on
+  // it, only once the GPU has run everything it issued with them (an event query it polls): nothing here waits for
+  // the host's context.
   D3D11Device(ID3D11Device* device, ID3D11DeviceContext* immediate, exec::Backend backend);
   ~D3D11Device() override;
 
@@ -104,6 +106,7 @@ class D3D11Device final : public exec::Device {
   GpuInfo gpu_;
   MemoryUse memoryUse_;
   bool debugLayer_ = false;
+  bool borrowed_ = false;
   uint64_t launches_ = 0, dispatches_ = 0;
 };
 

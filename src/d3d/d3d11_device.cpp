@@ -63,7 +63,7 @@ D3D11Device::D3D11Device(exec::Backend backend, bool debugLayer) : backend_(back
 }
 
 D3D11Device::D3D11Device(ID3D11Device* device, ID3D11DeviceContext* immediate, exec::Backend backend)
-    : device_(device), context_(immediate), backend_(backend) {
+    : device_(device), context_(immediate), backend_(backend), borrowed_(true) {
   if (!device || !immediate) throw std::runtime_error("a borrowed d3d11 execution needs the host's device and immediate context");
   init();
 }
@@ -98,7 +98,9 @@ void D3D11Device::init() {
 
 D3D11Device::~D3D11Device() {
   if (!device_) return;
-  try { waitForGpu(); } catch (...) {}   // everything issued has run before its resources go
+  // Everything issued has run before its resources go. On a host's context the host has proven that already, and
+  // its thread is not held here.
+  if (!borrowed_) try { waitForGpu(); } catch (...) {}
   destroyBuffer(zeros_);
   addDebugErrors(debugErrors());
 }
