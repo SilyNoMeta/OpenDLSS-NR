@@ -4,10 +4,11 @@
 //                  [--dump <dir>] [--json <file>]
 //   dlss5vk bridge --host d3d12|d3d11 --transport [--width W --height H] [--frames N] [--json <file>]
 //
-// Every frame, in the host's stream order: Direct3D writes the proxy texture; Vulkan (once the host's fence value is
-// reached) copies it to the proxy buffer, generates the features, runs the graph and copies the head to the head
-// texture; Direct3D (once Vulkan's fence value is reached) copies the head texture to a readback. The only CPU wait
-// is the one that ends the frame, where the time to a usable output is taken.
+// Every frame, in the host's stream order: Direct3D copies its proxy image into the shared proxy texture (a GPU
+// copy, as a game's producer is on the GPU); Vulkan (once the host's fence value is reached) copies it to the proxy
+// buffer, generates the features, runs the graph and copies the head to the shared head texture; Direct3D (once
+// Vulkan's fence value is reached) copies the head texture into a texture of its own. The only CPU wait is the one
+// that ends the frame, where the time to a usable output is taken; reading the result back to check it comes after.
 //
 // --transport runs no network: Vulkan copies the input texture to the output texture and one sub-rectangle of it to
 // another place, and Direct3D checks every texel. It is the cost and the proof of the transport alone.

@@ -43,27 +43,31 @@ void check(HRESULT hr, const char* what) {
 
 constexpr uint32_t kTexelBytes = 16;   // RGBA 32-bit float
 
-// The Direct3D side of the tool: it writes a shared texture from CPU bytes, reads one back, and ends a frame.
+// The Direct3D side of the tool. Inside a frame it does what a game does: GPU copies between its own textures and
+// the shared ones, in its own stream. The CPU only prepares the source before the frame and reads the result after
+// it (to check it); neither is part of the frame.
 struct Host {
   virtual ~Host() = default;
   virtual uint64_t luid() const = 0;
   virtual std::unique_ptr<Bridge> makeBridge(exec::Backend backend) = 0;
-  virtual void write(const SharedTexture& texture, const uint8_t* texels) = 0;   // issued and submitted
-  virtual void read(const SharedTexture& texture) = 0;                           // issued and submitted
-  virtual std::vector<uint8_t> finish(const SharedTexture& texture) = 0;         // the frame's one CPU wait, then the texels read
+  virtual void upload(const uint8_t* texels, uint32_t width, uint32_t height) = 0;   // CPU -> the host's source texture; waits
+  virtual void write(const SharedTexture& texture) = 0;    // frame: source -> shared (GPU copy, issued and submitted)
+  virtual void read(const SharedTexture& texture) = 0;     // frame: shared -> the host's result texture (GPU copy)
+  virtual void wait() = 0;                                  // frame: its one CPU wait, where the output is usable
+  virtual std::vector<uint8_t> result() = 0;                // the host's result texture -> CPU; waits
   virtual uint32_t debugErrors() = 0;
 };
 
 struct HostD3D12 final : Host {
   ComPtr<ID3D12Device> device;
   ComPtr<ID3D12CommandQueue> queue;
-  ComPtr<ID3D12CommandAllocator> allocators[2];
-  ComPtr<ID3D12GraphicsCommandList> lists[2];
+  ComPtr<ID3D12CommandAllocator> allocators[3];   // write, read, and the transfers outside the frame
+  ComPtr<ID3D12GraphicsCommandList> lists[3];
   ComPtr<ID3D12Fence> fence;
-  ComPtr<ID3D12Resource> upload, readback;
+  ComPtr<ID3D12Resource> source, target, staging[2];   // staging: upload, readback
   HANDLE event = nullptr;
-  uint64_t value = 0;
-  uint64_t stagingBytes = 0;
+  uint64_t value = 0, stagingBytes = 0;
+  uint32_t sourceWidth = 0, sourceHeight = 0, targetWidth = 0, targetHeight = 0;
   bool debug = false;
 
   explicit HostD3D12(bool debugLayer) {
@@ -76,7 +80,7 @@ struct HostD3D12 final : Host {
     check(D3D12CreateDevice(d3d::nvidiaAdapter().Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
       check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i])), "CreateCommandAllocator");
       check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].Get(), nullptr, IID_PPV_ARGS(&lists[i])), "CreateCommandList");
       check(lists[i]->Close(), "Close");
@@ -91,8 +95,22 @@ struct HostD3D12 final : Host {
   }
   std::unique_ptr<Bridge> makeBridge(exec::Backend backend) override { return std::make_unique<Bridge>(device.Get(), queue.Get(), backend); }
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint(const SharedTexture& texture) {
-    const D3D12_RESOURCE_DESC desc = texture.d3d12->GetDesc();
+  ComPtr<ID3D12Resource> texture(uint32_t width, uint32_t height, D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> resource;
+    check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource)), "CreateCommittedResource(host texture)");
+    return resource;
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint(ID3D12Resource* resource) {
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
     UINT64 total = 0;
     device->GetCopyableFootprints(&desc, 0, 1, 0, &placed, nullptr, nullptr, &total);
@@ -107,8 +125,9 @@ struct HostD3D12 final : Host {
         buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
         buffer.SampleDesc.Count = 1;
         buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        staging[kind].Reset();
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, kind ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ,
-                                              nullptr, IID_PPV_ARGS(kind ? &readback : &upload)),
+                                              nullptr, IID_PPV_ARGS(&staging[kind])),
               "CreateCommittedResource(staging)");
       }
     }
@@ -124,54 +143,81 @@ struct HostD3D12 final : Host {
     ID3D12CommandList* list[] = {lists[index].Get()};
     queue->ExecuteCommandLists(1, list);
   }
+  void drain() {
+    check(queue->Signal(fence.Get(), ++value), "Signal");
+    wait();
+  }
   static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
     list->ResourceBarrier(1, &barrier);
   }
-  void write(const SharedTexture& texture, const uint8_t* texels) override {
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed = footprint(texture);
+  void upload(const uint8_t* texels, uint32_t width, uint32_t height) override {
+    if (!source || sourceWidth != width || sourceHeight != height) {
+      source = texture(width, height, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      sourceWidth = width; sourceHeight = height;
+    }
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed = footprint(source.Get());
     uint8_t* mapped = nullptr;
-    check(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(upload)");
-    const size_t rowBytes = (size_t)texture.width * kTexelBytes;
-    for (uint32_t y = 0; y < texture.height; ++y) memcpy(mapped + placed.Offset + (size_t)y * placed.Footprint.RowPitch, texels + y * rowBytes, rowBytes);
-    upload->Unmap(0, nullptr);
+    check(staging[0]->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(upload)");
+    const size_t rowBytes = (size_t)width * kTexelBytes;
+    for (uint32_t y = 0; y < height; ++y) memcpy(mapped + placed.Offset + (size_t)y * placed.Footprint.RowPitch, texels + y * rowBytes, rowBytes);
+    staging[0]->Unmap(0, nullptr);
+    ID3D12GraphicsCommandList* list = begin(2);
+    transition(list, source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION from{staging[0].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    from.PlacedFootprint = placed;
+    D3D12_TEXTURE_COPY_LOCATION to{source.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    transition(list, source.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    submit(2);
+    drain();
+  }
+  void write(const SharedTexture& shared) override {
     ID3D12GraphicsCommandList* list = begin(0);
-    transition(list, texture.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_TEXTURE_COPY_LOCATION source{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = placed;
-    D3D12_TEXTURE_COPY_LOCATION target{texture.d3d12.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-    transition(list, texture.d3d12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    transition(list, shared.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(shared.d3d12.Get(), source.Get());
+    transition(list, shared.d3d12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     submit(0);
   }
-  void read(const SharedTexture& texture) override {
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed = footprint(texture);
+  void read(const SharedTexture& shared) override {
+    if (!target || targetWidth != shared.width || targetHeight != shared.height) {
+      target = texture(shared.width, shared.height, D3D12_RESOURCE_STATE_COPY_DEST);
+      targetWidth = shared.width; targetHeight = shared.height;
+    }
     ID3D12GraphicsCommandList* list = begin(1);
-    transition(list, texture.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION source{texture.d3d12.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION target{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    target.PlacedFootprint = placed;
-    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-    transition(list, texture.d3d12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    transition(list, shared.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyResource(target.Get(), shared.d3d12.Get());
+    transition(list, shared.d3d12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     submit(1);
     check(queue->Signal(fence.Get(), ++value), "Signal");
   }
-  std::vector<uint8_t> finish(const SharedTexture& texture) override {
+  void wait() override {
     if (fence->GetCompletedValue() < value) {
       check(fence->SetEventOnCompletion(value, event), "SetEventOnCompletion");
       if (WaitForSingleObject(event, 120000) != WAIT_OBJECT_0) throw std::runtime_error("the d3d12 host stream did not complete within 120 s");
     }
     check(device->GetDeviceRemovedReason(), "the d3d12 host device was removed");
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed = footprint(texture);
-    const size_t rowBytes = (size_t)texture.width * kTexelBytes;
-    std::vector<uint8_t> texels(rowBytes * texture.height);
+  }
+  std::vector<uint8_t> result() override {
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed = footprint(target.Get());
+    ID3D12GraphicsCommandList* list = begin(2);
+    transition(list, target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION to{staging[1].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    to.PlacedFootprint = placed;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    transition(list, target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    submit(2);
+    drain();
+    const size_t rowBytes = (size_t)targetWidth * kTexelBytes;
+    std::vector<uint8_t> texels(rowBytes * targetHeight);
     uint8_t* mapped = nullptr;
-    check(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(readback)");
-    for (uint32_t y = 0; y < texture.height; ++y) memcpy(texels.data() + y * rowBytes, mapped + placed.Offset + (size_t)y * placed.Footprint.RowPitch, rowBytes);
+    check(staging[1]->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(readback)");
+    for (uint32_t y = 0; y < targetHeight; ++y) memcpy(texels.data() + y * rowBytes, mapped + placed.Offset + (size_t)y * placed.Footprint.RowPitch, rowBytes);
     const D3D12_RANGE none{0, 0};
-    readback->Unmap(0, &none);
+    staging[1]->Unmap(0, &none);
     return texels;
   }
   uint32_t debugErrors() override {
@@ -195,8 +241,9 @@ struct HostD3D12 final : Host {
 struct HostD3D11 final : Host {
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11DeviceContext> context;
-  ComPtr<ID3D11Texture2D> staging;
-  uint32_t stagingWidth = 0, stagingHeight = 0;
+  ComPtr<ID3D11Texture2D> source, target, staging;
+  ComPtr<ID3D11Query> marker;
+  uint32_t sourceWidth = 0, sourceHeight = 0, targetWidth = 0, targetHeight = 0;
   bool debug = false;
 
   explicit HostD3D11(bool debugLayer) : debug(debugLayer) {
@@ -206,6 +253,8 @@ struct HostD3D11 final : Host {
                                          D3D11_SDK_VERSION, &device, &level, &context);
     if (FAILED(hr) && debugLayer) throw std::runtime_error("the D3D11 debug layer was asked for and is not installed");
     check(hr, "D3D11CreateDevice");
+    D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
+    check(device->CreateQuery(&desc, &marker), "CreateQuery(event)");
   }
   uint64_t luid() const override {
     ComPtr<IDXGIDevice> dxgi;
@@ -217,31 +266,57 @@ struct HostD3D11 final : Host {
     return (uint64_t)(uint32_t)desc.AdapterLuid.LowPart | ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32);
   }
   std::unique_ptr<Bridge> makeBridge(exec::Backend backend) override { return std::make_unique<Bridge>(device.Get(), context.Get(), backend); }
-  void write(const SharedTexture& texture, const uint8_t* texels) override {
-    context->UpdateSubresource(texture.d3d11.Get(), 0, nullptr, texels, texture.width * kTexelBytes, 0);
+  ComPtr<ID3D11Texture2D> texture(uint32_t width, uint32_t height, bool cpuRead) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = cpuRead ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT;
+    desc.BindFlags = cpuRead ? 0 : D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = cpuRead ? D3D11_CPU_ACCESS_READ : 0;
+    ComPtr<ID3D11Texture2D> resource;
+    check(device->CreateTexture2D(&desc, nullptr, &resource), "CreateTexture2D(host texture)");
+    return resource;
   }
-  void read(const SharedTexture& texture) override {
-    if (!staging || stagingWidth != texture.width || stagingHeight != texture.height) {
-      D3D11_TEXTURE2D_DESC desc{};
-      texture.d3d11->GetDesc(&desc);
-      desc.Usage = D3D11_USAGE_STAGING;
-      desc.BindFlags = 0;
-      desc.MiscFlags = 0;
-      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      staging.Reset();
-      check(device->CreateTexture2D(&desc, nullptr, &staging), "CreateTexture2D(staging)");
-      stagingWidth = texture.width; stagingHeight = texture.height;
+  void upload(const uint8_t* texels, uint32_t width, uint32_t height) override {
+    if (!source || sourceWidth != width || sourceHeight != height) {
+      source = texture(width, height, false);
+      sourceWidth = width; sourceHeight = height;
     }
-    context->CopyResource(staging.Get(), texture.d3d11.Get());
+    context->UpdateSubresource(source.Get(), 0, nullptr, texels, width * kTexelBytes, 0);
+    context->End(marker.Get());
+    wait();
   }
-  std::vector<uint8_t> finish(const SharedTexture& texture) override {
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    check(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map(staging)");   // waits for the stream
-    const size_t rowBytes = (size_t)texture.width * kTexelBytes;
-    std::vector<uint8_t> texels(rowBytes * texture.height);
-    for (uint32_t y = 0; y < texture.height; ++y) memcpy(texels.data() + y * rowBytes, static_cast<const uint8_t*>(mapped.pData) + (size_t)y * mapped.RowPitch, rowBytes);
-    context->Unmap(staging.Get(), 0);
+  void write(const SharedTexture& shared) override { context->CopyResource(shared.d3d11.Get(), source.Get()); }
+  void read(const SharedTexture& shared) override {
+    if (!target || targetWidth != shared.width || targetHeight != shared.height) {
+      target = texture(shared.width, shared.height, false);
+      staging = texture(shared.width, shared.height, true);
+      targetWidth = shared.width; targetHeight = shared.height;
+    }
+    context->CopyResource(target.Get(), shared.d3d11.Get());
+    context->End(marker.Get());
+  }
+  void wait() override {
+    context->Flush();
+    BOOL done = FALSE;
+    const ULONGLONG start = GetTickCount64();
+    while (context->GetData(marker.Get(), &done, sizeof(done), 0) != S_OK || !done) {
+      if (GetTickCount64() - start > 120000) throw std::runtime_error("the d3d11 host stream did not complete within 120 s");
+      SwitchToThread();
+    }
     check(device->GetDeviceRemovedReason(), "the d3d11 host device was removed");
+  }
+  std::vector<uint8_t> result() override {
+    context->CopyResource(staging.Get(), target.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map(staging)");
+    const size_t rowBytes = (size_t)targetWidth * kTexelBytes;
+    std::vector<uint8_t> texels(rowBytes * targetHeight);
+    for (uint32_t y = 0; y < targetHeight; ++y) memcpy(texels.data() + y * rowBytes, static_cast<const uint8_t*>(mapped.pData) + (size_t)y * mapped.RowPitch, rowBytes);
+    context->Unmap(staging.Get(), 0);
     return texels;
   }
   uint32_t debugErrors() override {
@@ -315,8 +390,9 @@ ToolResult runTool(const ToolInput& input) {
       for (uint32_t y = 0; y < rectH && toY + y < height; ++y)
         for (uint32_t x = 0; x < rectW && toX + x < width; ++x)
           memcpy(&expected[((size_t)(toY + y) * width + toX + x) * 4], &texels[((size_t)(rectY + y) * width + rectX + x) * 4], kTexelBytes);
+      host->upload(reinterpret_cast<const uint8_t*>(texels.data()), width, height);   // before the frame
       const auto frameStart = Clock::now();
-      host->write(source, reinterpret_cast<const uint8_t*>(texels.data()));
+      host->write(source);
       const uint64_t ready = link->signalReady();
       hostWriteMs.push_back(since(frameStart));
       const auto vulkanStart = Clock::now();
@@ -340,9 +416,10 @@ ToolResult runTool(const ToolInput& input) {
       link->waitDone(done);
       host->read(target);
       hostReadMs.push_back(since(readStart));
-      const std::vector<uint8_t> got = host->finish(target);
+      host->wait();
       wallMs.push_back(since(frameStart));
       link->collect();
+      const std::vector<uint8_t> got = host->result();   // after the frame
       size_t differing = 0;
       for (size_t i = 0; i < expected.size(); ++i) {
         uint32_t a, b;
@@ -385,11 +462,12 @@ ToolResult runTool(const ToolInput& input) {
     printf("graph: %zu launches and %zu dispatches per frame, %s kernels, chaining off\n", graphTape.launches(), graphTape.dispatches(),
            vulkan.nativeFp8() ? "cooperative-matrix GLSL and PTX" : "PTX and exact scalar");
 
+    host->upload(input.proxy.data(), input.proxyWidth, input.proxyHeight);   // the host's own image, once
     std::vector<uint8_t> first;
     for (int frame = 0; frame < input.frames; ++frame) {
       vulkan.nextFrame();
       const auto frameStart = Clock::now();
-      host->write(proxyTexture, input.proxy.data());
+      host->write(proxyTexture);
       const uint64_t ready = link->signalReady();
       hostWriteMs.push_back(since(frameStart));
 
@@ -419,9 +497,10 @@ ToolResult runTool(const ToolInput& input) {
       link->waitDone(done);
       host->read(headTexture);
       hostReadMs.push_back(since(readStart));
-      std::vector<uint8_t> head = host->finish(headTexture);
+      host->wait();
       wallMs.push_back(since(frameStart));
       link->collect();
+      std::vector<uint8_t> head = host->result();   // after the frame
       const std::vector<double> times = vulkan.readTimestampsMs(stamps, 4);
       gpuTotalMs.push_back(times[3] - times[0]);
       gpuGraphMs.push_back(times[2] - times[1]);
@@ -446,7 +525,7 @@ ToolResult runTool(const ToolInput& input) {
     link->destroyTexture(headTexture);
     printf("Vulkan GPU: median %.3f ms for the whole submission, %.3f ms for the graph alone\n", median(gpuTotalMs), median(gpuGraphMs));
   }
-  printf("frame: median %.3f ms to a usable output (host write %.3f ms + Vulkan record and submit %.3f ms + host read %.3f ms of CPU, the rest GPU)\n",
+  printf("frame: median %.3f ms to a usable output (host copy in %.3f ms + Vulkan record and submit %.3f ms + host copy out %.3f ms of CPU, the rest GPU)\n",
          median(wallMs), median(hostWriteMs), median(vulkanCpuMs), median(hostReadMs));
   const uint32_t hostErrors = host->debugErrors();
   if (input.debugLayer) printf("Direct3D debug layer: %u error%s\n", hostErrors, hostErrors == 1 ? "" : "s");
