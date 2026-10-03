@@ -25,6 +25,7 @@
 #include "numeric.h"
 #include "reference.h"
 #include "device_factory.h"
+#include "exec_tape.h"
 #include "vk_context.h"
 
 #if defined(_WIN32)
@@ -378,8 +379,11 @@ struct GraphRun {
   bool chained = false, repeatable = true;
 };
 
+// `recorder`: when the device the kernels were made on is a tape recorder, the graph is walked once into a tape and
+// every submission replays it on the real device (the way a host runs it).
 GraphRun runGraph(exec::Device& context, nr::Model& model, nr::Kernels& kernels, const nr::Geometry& geometry,
-                  const nr::Activation& features, bool chain, bool capture, int submissions) {
+                  const nr::Activation& features, bool chain, bool capture, int submissions, exec::TapeRecorder* recorder = nullptr,
+                  exec::Device* target = nullptr) {
   const bool chainBefore = kernels.chainEnabled();
   kernels.setChainEnabled(chainBefore && chain);
   GraphRun run;
@@ -392,14 +396,16 @@ GraphRun runGraph(exec::Device& context, nr::Model& model, nr::Kernels& kernels,
     options.fusedBlocks = fusedBlocksEnabled();
     nr::Graph graph(context, model, kernels, geometry, options);
     run.chained = graph.chained();
+    exec::Tape tape;
+    if (recorder) { graph.record(recorder->stream(), features); tape = recorder->take(); }
     exec::Timer queries = context.createTimestampPool(2);
     for (int submission = 0; submission < submissions; ++submission) {
       context.nextFrame();
       exec::Commands commands = context.beginCommands();
-      context.resetTimestamps(commands, queries, 2);
-      context.writeTimestamp(commands, queries, 0, true);
-      graph.record(commands, features);
-      context.writeTimestamp(commands, queries, 1, false);
+      if (recorder) target->resetTimestamps(commands, queries, 2); else context.resetTimestamps(commands, queries, 2);
+      if (recorder) target->writeTimestamp(commands, queries, 0, true); else context.writeTimestamp(commands, queries, 0, true);
+      if (recorder) tape.replay(*target, commands); else graph.record(commands, features);
+      if (recorder) target->writeTimestamp(commands, queries, 1, false); else context.writeTimestamp(commands, queries, 1, false);
       context.endAndSubmit(commands, true);
       checkChainTimeouts(kernels);
       std::vector<double> stamps = context.readTimestampsMs(queries, 2);
@@ -431,8 +437,13 @@ int runParity(int argc, char** argv) {
   const FixturePlan plan = planFixture(manifest, fixtureDir);
 
   const std::unique_ptr<exec::Device> owned = makeDevice();
-  exec::Device& context = *owned;
-  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
+  // DLSS5VK_TAPE=1: every graph is walked once into a tape and its submissions replay the tape.
+  const bool taped = getenv("DLSS5VK_TAPE") && atoi(getenv("DLSS5VK_TAPE")) != 0;
+  exec::TapeRecorder tapeRecorder(*owned);
+  exec::Device& context = taped ? static_cast<exec::Device&>(tapeRecorder) : *owned;
+  exec::TapeRecorder* const recorder = taped ? &tapeRecorder : nullptr;
+  printf("device: %s (%s, %s backend%s)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()),
+         taped ? ", graph replayed from a tape" : "");
   auto started = std::chrono::steady_clock::now();
   nr::Model model(context, modelDir, !hasFlag(argc, argv, "--no-verify"));
   printf("model loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
@@ -475,6 +486,7 @@ int runParity(int argc, char** argv) {
                                            (float)conditioning["style"].number};
     exec::Commands commands = context.beginCommands();
     kernels.preprocessFromProxy(commands, proxyBuffer, features, preprocess);
+    if (recorder) tapeRecorder.take().replay(*owned, commands);
     context.endAndSubmit(commands, true);
   } else {
     context.upload(features.buffer, inputBytes.data(), inputBytes.size());
@@ -491,21 +503,21 @@ int runParity(int argc, char** argv) {
 
   // The production schedule (no captures, chaining as configured) is what the head and output references are
   // compared against, resubmitted several times: its head must not change between submissions.
-  const GraphRun production = runGraph(context, model, kernels, geometry, features, true, false, repeats);
+  const GraphRun production = runGraph(context, model, kernels, geometry, features, true, false, repeats, recorder, owned.get());
   printf("production schedule (%s, no captures): %u dispatches, GPU %.3f ms (min of %d)\n",
          production.chained ? "counter chaining" : "barriers", production.dispatches, production.minGpuMs, repeats);
   printf("NaN weight codes replaced: %zu\n", model.nanWeightsReplaced());
   require(production.repeatable, ("head over " + std::to_string(repeats) + " production submissions").c_str());
   // Chaining is scheduling, not arithmetic: the same graph with a barrier after every launch gives the same head.
   if (production.chained)
-    require(runGraph(context, model, kernels, geometry, features, false, false, 1).head == production.head, "head with barriers instead of chaining");
+    require(runGraph(context, model, kernels, geometry, features, false, false, 1, recorder, owned.get()).head == production.head, "head with barriers instead of chaining");
   else
     printf("chaining is off in this configuration: the barrier schedule is the production schedule\n");
   // Boundaries come from an instrumented schedule, which adds a copy and two barriers at every boundary (and
   // materializes the deferred projections); that must not change the head either.
   GraphRun instrumented;
   if (plan.checkBoundaries) {
-    instrumented = runGraph(context, model, kernels, geometry, features, true, true, 1);
+    instrumented = runGraph(context, model, kernels, geometry, features, true, true, 1, recorder, owned.get());
     require(instrumented.head == production.head, "head of the instrumented schedule (boundary captures) vs production");
   }
 
@@ -601,7 +613,12 @@ int runBench(int argc, char** argv) {
   auto mib = [](VkDeviceSize bytes) { return bytes / 1048576.0; };
   auto started = Clock::now();
   const std::unique_ptr<exec::Device> owned = makeDevice();
-  exec::Device& context = *owned;
+  // --tape: walk the graph once and replay its recorded operations every frame (what a host does), instead of
+  // walking it every frame.
+  const bool taped = hasFlag(argc, argv, "--tape");
+  exec::TapeRecorder tapeRecorder(*owned);
+  exec::Device& context = taped ? static_cast<exec::Device&>(tapeRecorder) : *owned;
+  exec::Tape tape;
   vk::Context* const vulkan = dynamic_cast<vk::Context*>(owned.get());
   printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
   const double contextSeconds = seconds(started);
@@ -624,6 +641,11 @@ int runBench(int argc, char** argv) {
     graph = std::make_unique<nr::Graph>(context, model, kernels, geometry, nr::Graph::Options{.fusedBlocks = fusedBlocksEnabled()});
     features = graph->allocate("input features", fullRows, 16, nr::Format::F32);
     context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
+    if (taped) { graph->record(tapeRecorder.stream(), *features); tape = tapeRecorder.take(); }
+  };
+  auto emit = [&](exec::Commands commands) {
+    if (taped) tape.replay(*owned, commands);
+    else graph->record(commands, *features);
   };
   started = Clock::now();
   build();
@@ -633,7 +655,7 @@ int runBench(int argc, char** argv) {
   // graph with barriers, as the demo does, instead of failing the run; later frames still fail on one.
   {
     exec::Commands commands = context.beginCommands();
-    graph->record(commands, *features);
+    emit(commands);
     context.endAndSubmit(commands, true);
     const nr::Kernels::ChainTimeouts timeouts = kernels.chainTimeouts();
     if (timeouts.waits && kernels.chainEnabled()) {
@@ -644,7 +666,7 @@ int runBench(int argc, char** argv) {
       build();
       context.nextFrame();
       commands = context.beginCommands();
-      graph->record(commands, *features);
+      emit(commands);
       context.endAndSubmit(commands, true);
     }
     checkChainTimeouts(kernels);
@@ -659,7 +681,10 @@ int runBench(int argc, char** argv) {
          mib(memory.deviceLocal - modelBytes - model.matrixBytes()), mib(memory.peakDeviceLocal), mib(memory.hostVisible));
   exec::Timer queries = context.createTimestampPool(2);
   std::vector<double> samples;
-  std::vector<double> wallSamples;
+  std::vector<double> wallSamples, recordSamples, submitSamples;
+  auto milliseconds = [](std::chrono::high_resolution_clock::time_point from) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - from).count();
+  };
   // --secondary: the demo's (and a host's) way, the graph recorded once into a secondary command buffer that every
   // frame's primary executes; the descriptor sets stay in one pool for the secondary's lifetime.
   const bool secondary = hasFlag(argc, argv, "--secondary");
@@ -687,23 +712,56 @@ int runBench(int argc, char** argv) {
     const auto frameStart = std::chrono::high_resolution_clock::now();
     if (!secondary) context.nextFrame();
     exec::Commands commands = context.beginCommands();
-    context.resetTimestamps(commands, queries, 2);
-    context.writeTimestamp(commands, queries, 0, true);
+    owned->resetTimestamps(commands, queries, 2);
+    owned->writeTimestamp(commands, queries, 0, true);
+    // Recording is host time every frame (an immediate context executes while it records: there the split between
+    // recording and waiting is where the driver chooses to flush, and only their sum means something).
+    const auto recordStart = std::chrono::high_resolution_clock::now();
     if (secondary) vkCmdExecuteCommands(vk::handle(commands), 1, &prerecorded);
-    else graph->record(commands, *features);
-    context.writeTimestamp(commands, queries, 1, false);
+    else emit(commands);
+    recordSamples.push_back(milliseconds(recordStart));
+    owned->writeTimestamp(commands, queries, 1, false);
+    const auto submitStart = std::chrono::high_resolution_clock::now();
     context.endAndSubmit(commands, true);
-    wallSamples.push_back(std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - frameStart).count());
+    submitSamples.push_back(milliseconds(submitStart));
+    wallSamples.push_back(milliseconds(frameStart));
     checkChainTimeouts(kernels);
     std::vector<double> stamps = context.readTimestampsMs(queries, 2);
     samples.push_back(stamps[1] - stamps[0]);
     printf("frame %d: %.3f ms GPU (%u dispatches)\n", frame, samples.back(), kernels.dispatchCount());
   }
+  // Machine-readable samples, in frame order, for a harness that alternates configurations (--json <file>).
+  const std::string jsonPath = argValue(argc, argv, "--json");
+  if (!jsonPath.empty()) {
+    std::ofstream json(jsonPath, std::ios::binary);
+    auto list = [&](const char* name, const std::vector<double>& values) {
+      json << "  \"" << name << "\": [";
+      for (size_t i = 0; i < values.size(); ++i) json << (i ? ", " : "") << values[i];
+      json << "],\n";
+    };
+    json << "{\n  \"api\": \"" << context.api() << "\", \"backend\": \"" << exec::backendName(context.backend()) << "\",\n";
+    json << "  \"device\": \"" << context.deviceName() << "\", \"sm_count\": " << context.smCount() << ",\n";
+    json << "  \"shader_fp8\": " << (context.nativeFp8() ? "true" : "false") << ", \"chained\": " << (graph->chained() ? "true" : "false")
+         << ", \"secondary\": " << (secondary ? "true" : "false") << ", \"taped\": " << (taped ? "true" : "false") << ",\n";
+    json << "  \"width\": " << width << ", \"height\": " << height << ", \"full_width\": " << geometry.fullWidth << ", \"full_height\": "
+         << geometry.fullHeight << ", \"dispatches\": " << kernels.dispatchCount() << ",\n";
+    json << "  \"preparation_s\": {\"device\": " << contextSeconds << ", \"model\": " << modelSeconds << ", \"kernels\": " << kernelSeconds
+         << ", \"graph\": " << graphSeconds << ", \"first_frame\": " << firstFrameSeconds << "},\n";
+    json << "  \"memory_bytes\": {\"device_local\": " << memory.deviceLocal << ", \"peak_device_local\": " << memory.peakDeviceLocal
+         << ", \"host_visible\": " << memory.hostVisible << ", \"raw_tensors\": " << modelBytes << ", \"weights\": " << model.matrixBytes() << "},\n";
+    list("gpu_ms", samples);
+    list("record_ms", recordSamples);
+    list("submit_wait_ms", submitSamples);
+    json << "  \"host_frame_ms\": [";
+    for (size_t i = 0; i < wallSamples.size(); ++i) json << (i ? ", " : "") << wallSamples[i];
+    json << "]\n}\n";
+  }
+  auto median = [](std::vector<double> values) { std::sort(values.begin(), values.end()); return values[values.size() / 2]; };
   std::sort(samples.begin(), samples.end());
   printf("median %.3f ms, min %.3f ms over %d frames at %ux%u (full %ux%u)\n", samples[samples.size() / 2],
          samples.front(), frames, width, height, geometry.fullWidth, geometry.fullHeight);
-  std::sort(wallSamples.begin(), wallSamples.end());
-  printf("host frame: median %.3f ms (recording + submission + GPU wait; readback excluded)\n", wallSamples[wallSamples.size() / 2]);
+  printf("host frame: median %.3f ms (recording %.3f ms + submission and GPU wait %.3f ms; readback excluded)\n", median(wallSamples),
+         median(recordSamples), median(submitSamples));
   context.destroyTimestampPool(queries);
   if (secondaryPool) vkDestroyCommandPool(vulkan->device(), secondaryPool, nullptr);
   return 0;
@@ -765,8 +823,13 @@ int runImage(int argc, char** argv) {
   }
 
   const std::unique_ptr<exec::Device> owned = makeDevice();
-  exec::Device& context = *owned;
-  printf("device: %s (%s, %s backend)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()));
+  // DLSS5VK_TAPE=1: every graph is walked once into a tape and its submissions replay the tape.
+  const bool taped = getenv("DLSS5VK_TAPE") && atoi(getenv("DLSS5VK_TAPE")) != 0;
+  exec::TapeRecorder tapeRecorder(*owned);
+  exec::Device& context = taped ? static_cast<exec::Device&>(tapeRecorder) : *owned;
+  exec::TapeRecorder* const recorder = taped ? &tapeRecorder : nullptr;
+  printf("device: %s (%s, %s backend%s)\n", context.deviceName().c_str(), context.api(), exec::backendName(context.backend()),
+         taped ? ", graph replayed from a tape" : "");
   auto started = std::chrono::steady_clock::now();
   nr::Model model(context, modelDir, !hasFlag(argc, argv, "--no-verify"));
   printf("model loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());

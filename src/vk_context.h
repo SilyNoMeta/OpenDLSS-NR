@@ -130,7 +130,10 @@ class Context : public exec::Device {
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const override { return deviceName_; }
   Backend backend() const override { return backend_; }
-  bool nativeFp8() const override { return backend_ == Backend::Native; }   // FP8 cooperative matrices and conversions in GLSL
+  bool nativeFp8() const override { return backend_ == Backend::Native && shaderFp8_; }   // FP8 cooperative matrices and conversions in GLSL
+  // Run the native backend without its cooperative-matrix GLSL: FP8 PTX plus the exact scalar kernels, which is the
+  // kernel set the Direct3D adapters run. For comparing APIs on identical kernels; set before the Kernels are made.
+  void setShaderFp8(bool enabled) { shaderFp8_ = enabled; }
   uint32_t subgroupSize() const { return subgroupSize_; }
 
   // Buffers -----------------------------------------------------------------
@@ -214,6 +217,7 @@ class Context : public exec::Device {
   bool captureStatistics_ = false;
   uint32_t subgroupSize_ = 0;
   Backend backend_ = Backend::Native;
+  bool shaderFp8_ = true;
   bool executableProperties_ = false;   // VK_KHR_pipeline_executable_properties enabled (statistics)
   MemoryUse memoryUse_;
   bool owned_ = true;

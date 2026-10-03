@@ -46,6 +46,7 @@ add_executable(dlss5vk
     ${DLSS5VK_D3D_SOURCES}
     src/device_factory.cpp
     src/exec.cpp
+    src/exec_tape.cpp
     src/gpu_arch.cpp
     src/kernels.cpp
     src/main.cpp

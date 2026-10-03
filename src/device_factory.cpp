@@ -40,7 +40,14 @@ exec::Backend direct3dBackend() {
 
 std::unique_ptr<exec::Device> makeDevice() {
   const std::string api = lowerEnv("DLSS5VK_API");
-  if (api.empty() || api == "vulkan") return std::make_unique<vk::Context>();
+  if (api.empty() || api == "vulkan") {
+    auto context = std::make_unique<vk::Context>();
+    if (lowerEnv("DLSS5VK_SHADER_FP8") == "0") {
+      context->setShaderFp8(false);
+      fprintf(stderr, "kernels: no cooperative-matrix GLSL (DLSS5VK_SHADER_FP8=0): the Direct3D kernel set\n");
+    }
+    return context;
+  }
 #ifdef _WIN32
   const std::string validation = lowerEnv("DLSS5VK_VALIDATION");
   const bool debug = !validation.empty() && validation != "0";
