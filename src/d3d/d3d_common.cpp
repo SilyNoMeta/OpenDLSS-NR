@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <sstream>
 
@@ -194,14 +195,48 @@ ShaderSource shaderSourceFor(const std::string& spvPath) {
   return {name, directory + "/hlsl/" + name + ".hlsl"};
 }
 
-std::vector<uint8_t> compileShader(const ShaderSource& source, const exec::SpecConstants& constants) {
-  std::ifstream file(source.path, std::ios::binary);
-  if (!file)
-    throw std::runtime_error("the shader kernel " + source.name + " has no HLSL twin (" + source.path +
-                             "): a Direct3D graph route dispatched a kernel that only exists for Vulkan");
+namespace {
+bool readSourceFile(const std::string& path, std::string& text) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
   std::stringstream buffer;
   buffer << file.rdbuf();
-  const std::string text = buffer.str();
+  text = buffer.str();
+  return true;
+}
+ShaderSourceReader g_sourceReader = &readSourceFile;
+
+// #include "name": the source of that name next to the twin, through the same reader as the twin itself.
+class SourceIncludes final : public ID3DInclude {
+ public:
+  explicit SourceIncludes(const std::string& twinPath) {
+    const size_t slash = twinPath.find_last_of("/\\");
+    directory_ = slash == std::string::npos ? "" : twinPath.substr(0, slash + 1);
+  }
+  HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID, LPCVOID* data, UINT* bytes) override {
+    std::string text;
+    if (!g_sourceReader(directory_ + name, text)) return E_FAIL;
+    texts_.push_back(std::move(text));
+    *data = texts_.back().data();
+    *bytes = (UINT)texts_.back().size();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE Close(LPCVOID) override { return S_OK; }   // the texts live as long as the compilation
+
+ private:
+  std::string directory_;
+  std::deque<std::string> texts_;
+};
+}  // namespace
+
+void setShaderSourceReader(ShaderSourceReader reader) { g_sourceReader = reader ? reader : &readSourceFile; }
+
+std::vector<uint8_t> compileShader(const ShaderSource& source, const exec::SpecConstants& constants) {
+  std::string text;
+  if (!g_sourceReader(source.path, text))
+    throw std::runtime_error("the shader kernel " + source.name + " has no HLSL twin (" + source.path +
+                             "): a Direct3D graph route dispatched a kernel that only exists for Vulkan");
+  SourceIncludes includes(source.path);
   std::vector<std::string> names, values;
   for (const exec::SpecConstants::Entry& entry : constants.entries) {
     names.push_back("SPEC_" + std::to_string(entry.id));
@@ -212,7 +247,7 @@ std::vector<uint8_t> compileShader(const ShaderSource& source, const exec::SpecC
   macros.push_back({nullptr, nullptr});
   Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
   // IEEE strictness: the kernels' arithmetic is spelled operation by operation.
-  const HRESULT hr = D3DCompile(text.data(), text.size(), source.path.c_str(), macros.data(), D3D_COMPILE_STANDARD_FILE_INCLUDE, "main",
+  const HRESULT hr = D3DCompile(text.data(), text.size(), source.path.c_str(), macros.data(), &includes, "main",
                                 "cs_5_0", D3DCOMPILE_IEEE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
   if (FAILED(hr))
     throw std::runtime_error("HLSL " + source.name + ": " + (errors ? std::string((const char*)errors->GetBufferPointer(), errors->GetBufferSize()) : "compile failed"));

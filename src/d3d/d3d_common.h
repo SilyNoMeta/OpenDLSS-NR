@@ -53,6 +53,11 @@ struct ShaderSource {
   std::string path;   // the .hlsl file
 };
 ShaderSource shaderSourceFor(const std::string& spvPath);
+// Where the HLSL twins come from: files, unless a host that embeds them installs a reader. It is called with the
+// path a file read would open (the twin's, then "<its directory>/<name>" for each #include) and returns false when
+// there is no such source.
+using ShaderSourceReader = bool (*)(const std::string& path, std::string& text);
+void setShaderSourceReader(ShaderSourceReader reader);
 // cs_5_0 bytecode (it runs on Direct3D 11 and 12), the constants as SPEC_<id> macros.
 std::vector<uint8_t> compileShader(const ShaderSource& source, const exec::SpecConstants& constants);
 
